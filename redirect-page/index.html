@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>GDSync 認証</title>
+<style>
+  body { font-family: -apple-system, "Segoe UI", sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; background: #f5f5f5; color: #333; }
+  .card { background: #fff; border-radius: 12px; padding: 32px; max-width: 420px; text-align: center; box-shadow: 0 2px 12px rgba(0,0,0,.08); }
+  a.btn { display: inline-block; margin-top: 16px; padding: 12px 24px; background: #7c3aed; color: #fff; border-radius: 8px; text-decoration: none; font-weight: 600; }
+  .err { color: #c0392b; }
+  code { background: #eee; padding: 2px 6px; border-radius: 4px; word-break: break-all; }
+</style>
+</head>
+<body>
+<div class="card" id="card">
+  <h2>Obsidian に戻っています…</h2>
+  <p id="msg">自動で戻らない場合は下のボタンを押してください。</p>
+  <a class="btn" id="link" href="#">Obsidian に戻る</a>
+</div>
+<script>
+(function () {
+  var q = new URLSearchParams(location.search);
+  var error = q.get("error");
+  var code = q.get("code");
+  var state = q.get("state");
+  var card = document.getElementById("card");
+  if (error) {
+    card.innerHTML = '<h2 class="err">認証エラー</h2><p><code>' + error.replace(/</g, "&lt;") + '</code></p><p>Obsidian の GDSync 設定からやり直してください。</p>';
+    return;
+  }
+  if (!code) {
+    card.innerHTML = '<h2 class="err">認可コードがありません</h2><p>Obsidian の GDSync 設定から認証を開始してください。</p>';
+    return;
+  }
+  var target = "obsidian://gdsync-auth?code=" + encodeURIComponent(code) +
+    (state ? "&state=" + encodeURIComponent(state) : "");
+  document.getElementById("link").setAttribute("href", target);
+  // コードをURLバー履歴に残さない
+  try { history.replaceState(null, "", location.pathname); } catch (e) {}
+  location.href = target;
+})();
+</script>
+</body>
+</html>
