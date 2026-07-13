@@ -6,6 +6,7 @@ import {
 	PluginSettingTab,
 	Setting,
 } from "obsidian";
+import { t } from "./i18n";
 import type GdsyncPlugin from "./main";
 import { DriveItemMeta } from "./types";
 
@@ -22,7 +23,7 @@ class DriveFolderSuggestModal extends FuzzySuggestModal<FolderChoice> {
 		private onChoose: (c: FolderChoice) => void
 	) {
 		super(app);
-		this.setPlaceholder("Search for the Drive folder to sync…");
+		this.setPlaceholder(t.searchFolderPlaceholder);
 	}
 
 	getItems(): FolderChoice[] {
@@ -67,17 +68,15 @@ class ConnectionCodeModal extends Modal {
 
 	onOpen(): void {
 		const { contentEl } = this;
-		this.setTitle("Enter connection code");
-		contentEl.createEl("p", {
-			text: "Paste the connection code copied from your other device. It contains your credentials — delete it from wherever you sent it after connecting.",
-		});
+		this.setTitle(t.modalEnterCodeTitle);
+		contentEl.createEl("p", { text: t.modalEnterCodeDesc });
 		const ta = contentEl.createEl("textarea", {
 			cls: "gdsync-connection-code",
 		});
 		ta.rows = 6;
 		new Setting(contentEl).addButton((btn) =>
 			btn
-				.setButtonText("Connect")
+				.setButtonText(t.btnConnect)
 				.setCta()
 				.onClick(() => {
 					const v = ta.value.trim();
@@ -110,11 +109,11 @@ export class GdsyncSettingTab extends PluginSettingTab {
 		});
 
 		// ---------- Google 認証 ----------
-		new Setting(containerEl).setName("Google authentication").setHeading();
+		new Setting(containerEl).setName(t.headingGoogleAuth).setHeading();
 
 		new Setting(containerEl)
-			.setName("Client ID")
-			.setDesc("OAuth client ID from your own Google Cloud project (Desktop app type recommended).")
+			.setName(t.clientId)
+			.setDesc(t.clientIdDesc)
 			.addText((text) => {
 				text.setValue(s.clientId).onChange(async (v) => {
 					s.clientId = v.trim();
@@ -124,8 +123,8 @@ export class GdsyncSettingTab extends PluginSettingTab {
 			});
 
 		new Setting(containerEl)
-			.setName("Client secret")
-			.setDesc("Stored unencrypted in this vault's plugin data. Use a dedicated Google Cloud project.")
+			.setName(t.clientSecret)
+			.setDesc(t.clientSecretDesc)
 			.addText((text) => {
 				text.setValue(s.clientSecret).onChange(async (v) => {
 					s.clientSecret = v.trim();
@@ -136,10 +135,10 @@ export class GdsyncSettingTab extends PluginSettingTab {
 			});
 
 		new Setting(containerEl)
-			.setName("Redirect URI (optional)")
-			.setDesc("Only needed for browser sign-in directly on mobile. Leave empty if you sign in on desktop and connect this device with a connection code. If used, deploy the redirect page and register its URL in Google Cloud.")
+			.setName(t.redirectUri)
+			.setDesc(t.redirectUriDesc)
 			.addText((text) => {
-				text.setPlaceholder("https://example.github.io/gdsync/")
+				text.setPlaceholder(t.redirectUriPlaceholder)
 					.setValue(s.redirectUri)
 					.onChange(async (v) => {
 						s.redirectUri = v.trim();
@@ -149,61 +148,55 @@ export class GdsyncSettingTab extends PluginSettingTab {
 			});
 
 		const authStatus = s.tokens
-			? "authenticated"
+			? t.statusAuthenticated
 			: s.pendingAuth
-				? "waiting for browser…"
-				: "not authenticated";
+				? t.statusWaiting
+				: t.statusNot;
 		new Setting(containerEl)
-			.setName(`Status: ${authStatus}`)
+			.setName(t.statusLabel(authStatus))
 			.addButton((btn) =>
 				btn
-					.setButtonText(s.tokens ? "Re-authenticate" : "Authenticate with Google")
+					.setButtonText(s.tokens ? t.btnReauth : t.btnAuth)
 					.setCta()
 					.onClick(() => void this.plugin.auth.beginAuth())
 			)
 			.addButton((btn) =>
-				btn.setButtonText("Test connection").onClick(async () => {
+				btn.setButtonText(t.btnTestConnection).onClick(async () => {
 					try {
 						const user = await this.plugin.drive.about();
-						new Notice(
-							`GDSync: Connected — ${user.displayName} (${user.emailAddress})`
-						);
+						new Notice(t.connectedNotice(user.displayName, user.emailAddress));
 					} catch (e) {
 						new Notice(
-							`GDSync: Connection test failed — ${e instanceof Error ? e.message : String(e)}`
+							t.connTestFailed(e instanceof Error ? e.message : String(e))
 						);
 					}
 				})
 			)
 			.addButton((btn) =>
-				btn.setButtonText("Log out").setWarning().onClick(async () => {
+				btn.setButtonText(t.btnLogout).setWarning().onClick(async () => {
 					await this.plugin.auth.logout();
 					this.display();
 				})
 			);
 
 		const connDesc = new Setting(containerEl)
-			.setName("Connection code")
-			.setDesc(
-				"Moves this authentication to another device (e.g. sign in on desktop, then paste the code on your phone). The code contains your credentials and tokens — treat it like a password and delete it after use."
-			);
+			.setName(t.connCode)
+			.setDesc(t.connCodeDesc);
 		if (s.tokens) {
 			connDesc.addButton((btn) =>
-				btn.setButtonText("Copy code").onClick(async () => {
+				btn.setButtonText(t.btnCopyCode).onClick(async () => {
 					const code = this.plugin.auth.exportConnectionCode();
 					if (!code) {
-						new Notice("GDSync: Authenticate first.");
+						new Notice(t.authFirst);
 						return;
 					}
 					await navigator.clipboard.writeText(code);
-					new Notice(
-						"GDSync: Connection code copied. Treat it like a password."
-					);
+					new Notice(t.codeCopied);
 				})
 			);
 		}
 		connDesc.addButton((btn) =>
-			btn.setButtonText("Enter code").onClick(() => {
+			btn.setButtonText(t.btnEnterCode).onClick(() => {
 				new ConnectionCodeModal(this.app, (code) => {
 					void this.plugin.auth.importConnectionCode(code).then((ok) => {
 						if (ok) this.display();
@@ -213,17 +206,17 @@ export class GdsyncSettingTab extends PluginSettingTab {
 		);
 
 		// ---------- 同期対象 ----------
-		new Setting(containerEl).setName("Sync target").setHeading();
+		new Setting(containerEl).setName(t.headingSyncTarget).setHeading();
 
 		new Setting(containerEl)
-			.setName("Drive folder")
+			.setName(t.driveFolder)
 			.setDesc(
 				s.rootFolderName
-					? `Selected: ${s.rootFolderName} (${s.rootFolderId})`
-					: "The Google Drive folder to treat as the vault mirror. You can also paste a Drive URL."
+					? t.driveFolderSelected(s.rootFolderName, s.rootFolderId)
+					: t.driveFolderDesc
 			)
 			.addText((text) => {
-				text.setPlaceholder("Folder ID or Drive URL")
+				text.setPlaceholder(t.driveFolderPlaceholder)
 					.setValue(s.rootFolderId)
 					.onChange(async (v) => {
 						s.rootFolderId = extractFolderId(v);
@@ -232,9 +225,9 @@ export class GdsyncSettingTab extends PluginSettingTab {
 					});
 			})
 			.addButton((btn) =>
-				btn.setButtonText("Choose from list").onClick(async () => {
+				btn.setButtonText(t.btnChooseFromList).onClick(async () => {
 					try {
-						new Notice("GDSync: Fetching folder list…");
+						new Notice(t.fetchingFolders);
 						const folders = await this.plugin.drive.listAllFolders();
 						const choices = buildFolderChoices(folders);
 						new DriveFolderSuggestModal(this.app, choices, async (c) => {
@@ -245,15 +238,15 @@ export class GdsyncSettingTab extends PluginSettingTab {
 						}).open();
 					} catch (e) {
 						new Notice(
-							`GDSync: Failed to fetch folder list — ${e instanceof Error ? e.message : String(e)}`
+							t.fetchFoldersFailed(e instanceof Error ? e.message : String(e))
 						);
 					}
 				})
 			);
 
 		new Setting(containerEl)
-			.setName("Mirror base folder")
-			.setDesc("The Drive folder structure is recreated under this folder in your vault.")
+			.setName(t.mirrorBase)
+			.setDesc(t.mirrorBaseDesc)
 			.addText((text) =>
 				text.setValue(s.baseFolder).onChange(async (v) => {
 					s.baseFolder = v.trim() || "GDrive";
@@ -262,8 +255,8 @@ export class GdsyncSettingTab extends PluginSettingTab {
 			);
 
 		new Setting(containerEl)
-			.setName("Exclude patterns")
-			.setDesc("One pattern per line. Paths containing a pattern are not synced.")
+			.setName(t.excludePatterns)
+			.setDesc(t.excludePatternsDesc)
 			.addTextArea((ta) => {
 				ta.setValue(s.excludePatterns).onChange(async (v) => {
 					s.excludePatterns = v;
@@ -273,21 +266,21 @@ export class GdsyncSettingTab extends PluginSettingTab {
 			});
 
 		new Setting(containerEl)
-			.setName("Build or update index (full scan)")
-			.setDesc("Lists your Drive files and creates the folder structure and stub files.")
+			.setName(t.buildIndex)
+			.setDesc(t.buildIndexDesc)
 			.addButton((btn) =>
 				btn
-					.setButtonText("Run full scan")
+					.setButtonText(t.btnRunFullScan)
 					.setCta()
 					.onClick(() => void this.plugin.engine.fullScan())
 			);
 
 		// ---------- 動作設定 ----------
-		new Setting(containerEl).setName("Behavior").setHeading();
+		new Setting(containerEl).setName(t.headingBehavior).setHeading();
 
 		new Setting(containerEl)
-			.setName("Maximum file size (MB)")
-			.setDesc("Files larger than this are not downloaded.")
+			.setName(t.maxFileSize)
+			.setDesc(t.maxFileSizeDesc)
 			.addText((text) =>
 				text.setValue(String(s.maxFileSizeMB)).onChange(async (v) => {
 					const n = parseInt(v, 10);
@@ -299,8 +292,8 @@ export class GdsyncSettingTab extends PluginSettingTab {
 			);
 
 		new Setting(containerEl)
-			.setName("Upload debounce (seconds)")
-			.setDesc("How long to wait after you stop editing before uploading.")
+			.setName(t.uploadDebounce)
+			.setDesc(t.uploadDebounceDesc)
 			.addText((text) =>
 				text.setValue(String(s.uploadDebounceSec)).onChange(async (v) => {
 					const n = parseInt(v, 10);
@@ -312,8 +305,8 @@ export class GdsyncSettingTab extends PluginSettingTab {
 			);
 
 		new Setting(containerEl)
-			.setName("Freshness check interval (minutes)")
-			.setDesc("How often to check for remote updates when opening a cached file.")
+			.setName(t.freshness)
+			.setDesc(t.freshnessDesc)
 			.addText((text) =>
 				text.setValue(String(s.freshnessTtlMin)).onChange(async (v) => {
 					const n = parseInt(v, 10);
@@ -325,8 +318,8 @@ export class GdsyncSettingTab extends PluginSettingTab {
 			);
 
 		new Setting(containerEl)
-			.setName("Cache retention (days)")
-			.setDesc("Files not opened for this many days are released back to stubs.")
+			.setName(t.cacheRetention)
+			.setDesc(t.cacheRetentionDesc)
 			.addText((text) =>
 				text.setValue(String(s.cacheMaxAgeDays)).onChange(async (v) => {
 					const n = parseInt(v, 10);
@@ -338,8 +331,8 @@ export class GdsyncSettingTab extends PluginSettingTab {
 			);
 
 		new Setting(containerEl)
-			.setName("Cache maximum count")
-			.setDesc("Maximum number of files kept with content (oldest are released first).")
+			.setName(t.cacheMaxCount)
+			.setDesc(t.cacheMaxCountDesc)
 			.addText((text) =>
 				text.setValue(String(s.cacheMaxCount)).onChange(async (v) => {
 					const n = parseInt(v, 10);
@@ -351,8 +344,8 @@ export class GdsyncSettingTab extends PluginSettingTab {
 			);
 
 		new Setting(containerEl)
-			.setName("Enable on desktop")
-			.setDesc("Usually unnecessary — on desktop, use a Google Drive for Desktop synced folder as the vault instead.")
+			.setName(t.enableOnDesktop)
+			.setDesc(t.enableOnDesktopDesc)
 			.addToggle((toggle) =>
 				toggle.setValue(s.enableOnDesktop).onChange(async (v) => {
 					s.enableOnDesktop = v;
@@ -361,44 +354,38 @@ export class GdsyncSettingTab extends PluginSettingTab {
 			);
 
 		// ---------- メンテナンス ----------
-		new Setting(containerEl).setName("Maintenance").setHeading();
+		new Setting(containerEl).setName(t.headingMaintenance).setHeading();
 
 		new Setting(containerEl)
-			.setName("Sync now")
-			.setDesc("Sends pending uploads and structure changes, then fetches remote changes.")
+			.setName(t.settingsSyncNow)
+			.setDesc(t.settingsSyncNowDesc)
 			.addButton((btn) =>
-				btn.setButtonText("Sync").onClick(() => void this.plugin.engine.syncNow())
+				btn.setButtonText(t.btnSync).onClick(() => void this.plugin.engine.syncNow())
 			);
 
 		new Setting(containerEl)
-			.setName("Clean up cache")
-			.setDesc("Releases old cached content back to stub files.")
+			.setName(t.cleanCache)
+			.setDesc(t.cleanCacheDesc)
 			.addButton((btn) =>
-				btn.setButtonText("Run").onClick(async () => {
+				btn.setButtonText(t.btnRun).onClick(async () => {
 					await this.plugin.engine.evictCache();
-					new Notice("GDSync: Cache cleanup finished.");
+					new Notice(t.cacheCleanupDone);
 				})
 			);
 
 		new Setting(containerEl)
-			.setName("Reset index")
-			.setDesc(
-				"Sync first if you have unsent edits. After resetting, run a full scan to rebuild."
-			)
+			.setName(t.resetIndex)
+			.setDesc(t.resetIndexDesc)
 			.addButton((btn) =>
-				btn.setWarning().setButtonText("Reset").onClick(async () => {
+				btn.setWarning().setButtonText(t.btnReset).onClick(async () => {
 					const dirty = this.plugin.index.dirtyPaths().length;
 					if (dirty > 0) {
-						new Notice(
-							`GDSync: ${dirty} edit(s) have not been uploaded yet. Run "Sync now" first.`
-						);
+						new Notice(t.unsentEdits(dirty));
 						return;
 					}
 					this.plugin.index.reset(s.rootFolderId);
 					await this.plugin.index.flush();
-					new Notice(
-						"GDSync: Index has been reset. Run a full scan to rebuild it."
-					);
+					new Notice(t.indexReset);
 				})
 			);
 	}

@@ -2,6 +2,7 @@ import { Notice, Platform, Plugin, TFile, TFolder } from "obsidian";
 import { AuthManager } from "./auth";
 import { DriveClient } from "./drive-client";
 import { FileIndex } from "./file-index";
+import { t } from "./i18n";
 import { GdsyncSettingTab } from "./settings";
 import { StatusDisplay } from "./status";
 import { SyncEngine } from "./sync-engine";
@@ -36,27 +37,27 @@ export default class GdsyncPlugin extends Plugin {
 
 		this.addCommand({
 			id: "authenticate",
-			name: "Authenticate with Google",
+			name: t.cmdAuthenticate,
 			callback: () => void this.auth.beginAuth(),
 		});
 		this.addCommand({
 			id: "full-scan",
-			name: "Full scan (build or update index)",
+			name: t.cmdFullScan,
 			callback: () => void this.engine.fullScan(),
 		});
 		this.addCommand({
 			id: "sync-now",
-			name: "Sync now",
+			name: t.cmdSyncNow,
 			callback: () => void this.engine.syncNow(),
 		});
 		this.addCommand({
 			id: "evict-cache",
-			name: "Clean up cache (release old content)",
+			name: t.cmdEvictCache,
 			callback: () => void this.engine.evictCache(),
 		});
 		this.addCommand({
 			id: "hydrate-current",
-			name: "Re-download current file",
+			name: t.cmdHydrateCurrent,
 			checkCallback: (checking) => {
 				const file = this.app.workspace.getActiveFile();
 				if (!file) return false;
@@ -75,7 +76,7 @@ export default class GdsyncPlugin extends Plugin {
 		});
 		this.addCommand({
 			id: "upload-current",
-			name: "Upload current file now",
+			name: t.cmdUploadCurrent,
 			checkCallback: (checking) => {
 				const file = this.app.workspace.getActiveFile();
 				if (!file) return false;
@@ -91,7 +92,7 @@ export default class GdsyncPlugin extends Plugin {
 			},
 		});
 
-		this.addRibbonIcon("refresh-cw", "GDSync: Sync now", () =>
+		this.addRibbonIcon("refresh-cw", t.ribbonSyncNow, () =>
 			void this.engine.syncNow()
 		);
 
@@ -177,7 +178,7 @@ export default class GdsyncPlugin extends Plugin {
 	/** 認証成功直後のフック */
 	onAuthenticated(): void {
 		if (!this.settings.rootFolderId) {
-			new Notice("GDSync: Next, choose the Google Drive folder to sync in the settings tab.");
+			new Notice(t.chooseFolderNext);
 		}
 	}
 

@@ -1,5 +1,6 @@
 import { Notice, Platform, requestUrl } from "obsidian";
 import type { Server } from "http";
+import { t } from "./i18n";
 import type GdsyncPlugin from "./main";
 
 const AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth";
@@ -67,7 +68,7 @@ export class AuthManager {
 	async beginAuth(): Promise<void> {
 		const s = this.plugin.settings;
 		if (!s.clientId || !s.clientSecret) {
-			new Notice("GDSync: Set the client ID and client secret first.");
+			new Notice(t.setCredsFirst);
 			return;
 		}
 		if (Platform.isDesktopApp) {
@@ -75,10 +76,7 @@ export class AuthManager {
 			return;
 		}
 		if (!s.redirectUri) {
-			new Notice(
-				"GDSync: On mobile, either paste a connection code created on desktop (settings → Connection code), or set a redirect URI for browser sign-in.",
-				12000
-			);
+			new Notice(t.mobileNoRedirect, 12000);
 			return;
 		}
 		await this.beginRedirectAuth();
@@ -142,15 +140,15 @@ export class AuthManager {
 			res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
 			res.end(
 				"<!DOCTYPE html><html><body style=\"font-family:sans-serif;text-align:center;padding-top:15vh\">" +
-					"<h2>GDSync</h2><p>You can close this tab and return to Obsidian.</p></body></html>"
+					`<h2>GDSync</h2><p>${t.loopbackPageBody}</p></body></html>`
 			);
 			this.stopLoopback();
 			if (error) {
-				new Notice(`GDSync: Authentication was cancelled or failed (${error}).`);
+				new Notice(t.authCancelled(error));
 				return;
 			}
 			if (st !== state) {
-				new Notice("GDSync: Authentication state mismatch. Please start authentication again.");
+				new Notice(t.stateMismatch);
 				return;
 			}
 			void this.exchangeCode(code!, verifier, LOOPBACK_REDIRECT_URI);
@@ -162,11 +160,7 @@ export class AuthManager {
 				server.listen(LOOPBACK_PORT, "127.0.0.1", () => resolve());
 			});
 		} catch (e) {
-			new Notice(
-				`GDSync: Could not open local port ${LOOPBACK_PORT} for sign-in (is another app using it?). ` +
-					`Close the conflicting app, or use the redirect-page sign-in instead.`,
-				12000
-			);
+			new Notice(t.portInUse(LOOPBACK_PORT), 12000);
 			return;
 		}
 		this.loopbackServer = server;
@@ -206,22 +200,22 @@ export class AuthManager {
 	async handleCallback(params: Record<string, string>): Promise<void> {
 		const s = this.plugin.settings;
 		if (params.error) {
-			new Notice(`GDSync: Authentication was cancelled or failed (${params.error}).`);
+			new Notice(t.authCancelled(params.error));
 			return;
 		}
 		const pending = s.pendingAuth;
 		if (!pending || !params.state || params.state !== pending.state) {
-			new Notice("GDSync: Authentication state mismatch. Please start authentication again.");
+			new Notice(t.stateMismatch);
 			return;
 		}
 		if (Date.now() - pending.createdAt > PENDING_AUTH_TTL_MS) {
 			s.pendingAuth = null;
 			await this.plugin.saveSettings();
-			new Notice("GDSync: The authentication request has expired. Please start again.");
+			new Notice(t.authExpired);
 			return;
 		}
 		if (!params.code) {
-			new Notice("GDSync: Missing authorization code.");
+			new Notice(t.missingCode);
 			return;
 		}
 		await this.exchangeCode(params.code, pending.codeVerifier, s.redirectUri);
@@ -257,7 +251,7 @@ export class AuthManager {
 			}
 			const data = res.json;
 			if (!data.refresh_token) {
-				throw new Error("No refresh_token was returned. Check that prompt=consent is effective on the Google Cloud side.");
+				throw new Error(t.noRefreshToken);
 			}
 			s.tokens = {
 				accessToken: data.access_token,
@@ -266,11 +260,11 @@ export class AuthManager {
 			};
 			s.pendingAuth = null;
 			await this.plugin.saveSettings();
-			new Notice("GDSync: Google authentication succeeded.");
+			new Notice(t.authSucceeded);
 			this.plugin.onAuthenticated();
 		} catch (e) {
 			console.error("gdsync auth code exchange failed", e);
-			new Notice(`GDSync: Token exchange failed. ${e instanceof Error ? e.message : ""}`);
+			new Notice(t.tokenExchangeFailed(e instanceof Error ? e.message : ""));
 		}
 	}
 
@@ -301,7 +295,7 @@ export class AuthManager {
 			const json = decodeURIComponent(escape(atob(codeText.trim())));
 			payload = JSON.parse(json) as ConnectionPayload;
 		} catch (e) {
-			new Notice("GDSync: Invalid connection code.");
+			new Notice(t.invalidConnectionCode);
 			return false;
 		}
 		if (
@@ -310,7 +304,7 @@ export class AuthManager {
 			!payload.clientSecret ||
 			!payload.tokens?.refreshToken
 		) {
-			new Notice("GDSync: Invalid connection code.");
+			new Notice(t.invalidConnectionCode);
 			return false;
 		}
 		const s = this.plugin.settings;
@@ -324,22 +318,22 @@ export class AuthManager {
 		};
 		s.pendingAuth = null;
 		await this.plugin.saveSettings();
-		new Notice("GDSync: Connected with the connection code.");
+		new Notice(t.connectedWithCode);
 		this.plugin.onAuthenticated();
 		return true;
 	}
 
 	/** 有効なアクセストークンを返す。期限切れなら先にリフレッシュ */
 	async getAccessToken(): Promise<string> {
-		const t = this.plugin.settings.tokens;
-		if (!t?.refreshToken) {
-			throw new AuthError("Not authenticated with Google. Authenticate from the GDSync settings.");
+		const tok = this.plugin.settings.tokens;
+		if (!tok?.refreshToken) {
+			throw new AuthError(t.notAuthenticated);
 		}
-		if (Date.now() >= t.expiresAt) {
+		if (Date.now() >= tok.expiresAt) {
 			await this.refresh();
 		}
 		const cur = this.plugin.settings.tokens;
-		if (!cur) throw new AuthError("Re-authentication required.");
+		if (!cur) throw new AuthError(t.reauthRequired);
 		return cur.accessToken;
 	}
 
@@ -366,12 +360,12 @@ export class AuthManager {
 
 	private async doRefresh(): Promise<void> {
 		const s = this.plugin.settings;
-		const t = s.tokens;
-		if (!t?.refreshToken) throw new AuthError("Re-authentication required.");
+		const tok = s.tokens;
+		if (!tok?.refreshToken) throw new AuthError(t.reauthRequired);
 		const body = new URLSearchParams({
 			client_id: s.clientId,
 			client_secret: s.clientSecret,
-			refresh_token: t.refreshToken,
+			refresh_token: tok.refreshToken,
 			grant_type: "refresh_token",
 		});
 		let res;
@@ -385,7 +379,7 @@ export class AuthManager {
 			});
 		} catch (e) {
 			// ネットワーク断はトークンを破棄しない
-			throw new Error("GDSync: Token refresh failed (offline?).");
+			throw new Error(t.tokenRefreshOffline);
 		}
 		if (res.status >= 400) {
 			const err = res.json?.error;
@@ -393,14 +387,14 @@ export class AuthManager {
 				// リフレッシュトークン失効 → 再認証が必要
 				s.tokens = null;
 				await this.plugin.saveSettings();
-				throw new AuthError("Google authentication has expired. Re-authenticate from the settings.");
+				throw new AuthError(t.authExpiredReauth);
 			}
-			throw new Error(`GDSync: Token refresh error ${res.status}: ${res.json?.error_description || ""}`);
+			throw new Error(t.tokenRefreshError(res.status, res.json?.error_description || ""));
 		}
 		const data = res.json;
 		s.tokens = {
 			accessToken: data.access_token,
-			refreshToken: data.refresh_token || t.refreshToken,
+			refreshToken: data.refresh_token || tok.refreshToken,
 			expiresAt: Date.now() + (data.expires_in - 60) * 1000,
 		};
 		await this.plugin.saveSettings();

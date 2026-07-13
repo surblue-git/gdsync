@@ -8,6 +8,7 @@ import {
 	NetworkError,
 } from "./drive-client";
 import { FileIndex } from "./file-index";
+import { t } from "./i18n";
 import { StatusDisplay } from "./status";
 import { DriveChange, DriveItemMeta, IndexEntry } from "./types";
 import { UploadQueue } from "./upload-queue";
@@ -162,20 +163,20 @@ export class SyncEngine {
 	async fullScan(): Promise<void> {
 		const s = this.plugin.settings;
 		if (!s.rootFolderId) {
-			new Notice("GDSync: No Google Drive folder has been selected.");
+			new Notice(t.noFolderSelected);
 			return;
 		}
 		if (this.scanning) {
-			new Notice("GDSync: A scan is already running.");
+			new Notice(t.scanAlreadyRunning);
 			return;
 		}
 		this.scanning = true;
 		try {
-			this.status.progress("Listing Drive files…");
+			this.status.progress(t.listingDriveFiles);
 			// リスト取得前にトークンを確保 → スキャン中の変更を取りこぼさない
 			const startToken = await this.drive.getStartPageToken();
 			const items = await this.drive.listAll((count) =>
-				this.status.progress(`Listing Drive files… ${count}`)
+				this.status.progress(t.listingDriveFilesCount(count))
 			);
 
 			// parents ポインタからツリー再構成（BFS）
@@ -235,14 +236,11 @@ export class SyncEngine {
 					`folders=${remoteFolders.size}, files=${remoteFiles.size}`
 			);
 			if (remoteFiles.size === 0 && remoteFolders.size > 0) {
-				new Notice(
-					"GDSync: Folders were found but no files matched. Check the exclude patterns and the selected Drive folder.",
-					15000
-				);
+				new Notice(t.foldersNoFiles, 15000);
 			}
 
 			// --- ローカルへ反映 ---
-			this.status.progress("Creating folders…");
+			this.status.progress(t.creatingFolders);
 			await this.ops.ensureFolder(this.basePath());
 			const sortedFolders = Array.from(remoteFolders.keys()).sort(
 				(a, b) => a.split("/").length - b.split("/").length
@@ -321,7 +319,7 @@ export class SyncEngine {
 					console.error("gdsync: failed to create stub", rel, e);
 				}
 				if (i % 50 === 0) {
-					this.status.progress(`Creating stubs… ${i}/${remoteFiles.size}`);
+					this.status.progress(t.creatingStubs(i, remoteFiles.size));
 					await yieldToUI();
 				}
 			}
@@ -361,18 +359,15 @@ export class SyncEngine {
 			this.status.endProgress();
 			if (failed > 0) {
 				new Notice(
-					`GDSync: Scan finished (${created} of ${remoteFiles.size} files created, ${failed} failed)\nFirst failure: ${firstError}`,
+					t.scanFinishedWithFailures(created, remoteFiles.size, failed, firstError ?? ""),
 					15000
 				);
 			} else {
-				new Notice(
-					`GDSync: Scan finished (${remoteFiles.size} files / ${created} new stubs)`,
-					8000
-				);
+				new Notice(t.scanFinished(remoteFiles.size, created), 8000);
 			}
 		} catch (e) {
 			this.status.endProgress();
-			this.notifyError("Scan failed", e);
+			this.notifyError(t.scanFailed, e);
 		} finally {
 			this.scanning = false;
 		}
@@ -390,9 +385,7 @@ export class SyncEngine {
 		if (!entry.fileId) return; // ローカル新規（リモート未作成）
 		await this.withLock(rel, async () => {
 			if (entry.tooLarge) {
-				new Notice(
-					`GDSync: ${file.name} exceeds the size limit (${this.plugin.settings.maxFileSizeMB} MB) and will not be downloaded.`
-				);
+				new Notice(t.tooLargeOnOpen(file.name, this.plugin.settings.maxFileSizeMB));
 				return;
 			}
 			if (!entry.hydrated) {
@@ -428,10 +421,10 @@ export class SyncEngine {
 		if (entry.remoteSize > maxSize) {
 			entry.tooLarge = true;
 			this.index.markDirty();
-			new Notice(`GDSync: ${file.name} exceeds the size limit and will not be downloaded.`);
+			new Notice(t.tooLarge(file.name));
 			return false;
 		}
-		this.status.set(`Downloading ${file.name}…`);
+		this.status.set(t.downloading(file.name));
 		try {
 			const data = await this.drive.download(entry.fileId);
 			await this.ops.writeContent(file, data);
@@ -444,7 +437,7 @@ export class SyncEngine {
 			await this.index.flush();
 			return true;
 		} catch (e) {
-			this.notifyError(`Failed to download ${file.name}`, e);
+			this.notifyError(t.downloadFailed(file.name), e);
 			return false;
 		} finally {
 			this.status.set("");
@@ -465,9 +458,7 @@ export class SyncEngine {
 		}
 		if (!entry.hydrated && entry.fileId) {
 			// ガード1: 未ハイドレートのスタブ編集はアップロードさせない
-			new Notice(
-				"GDSync: This file's content has not been downloaded yet, so this edit will not be uploaded. Reopen the file while online first."
-			);
+			new Notice(t.stubEditWarning);
 			return;
 		}
 		entry.dirty = true;
@@ -661,9 +652,7 @@ export class SyncEngine {
 			}
 			// ガード3: ローカルが空でリモートに内容がある場合は事故防止のため送らない
 			if (data.byteLength === 0 && entry.remoteSize > 0) {
-				new Notice(
-					`GDSync: Upload of ${file.name} was cancelled because it is empty while the remote copy has content. If this is intentional, open the remote version once and then edit it.`
-				);
+				new Notice(t.emptyUploadCancelled(file.name));
 				return true;
 			}
 			try {
@@ -728,10 +717,10 @@ export class SyncEngine {
 					return true; // 再認証されるまでリトライしない（dirty は残る）
 				}
 				if (e instanceof NetworkError) {
-					this.status.set("Offline (upload pending)");
+					this.status.set(t.offlineUploadPending);
 					return false; // バックオフでリトライ
 				}
-				this.notifyError(`Failed to upload ${file.name}`, e);
+				this.notifyError(t.uploadFailed(file.name), e);
 				return false;
 			}
 		});
@@ -780,9 +769,7 @@ export class SyncEngine {
 		entry.remoteSize = num(remote.size);
 		entry.dirty = false;
 		await this.downloadInto(file, entry);
-		new Notice(
-			`GDSync: Conflict detected. The local version was saved as "${conflictName}" and ${file.name} was updated to the remote version.`
-		);
+		new Notice(t.conflictDetected(conflictName, file.name));
 	}
 
 	// ---------------- リモートフォルダ解決 ----------------
@@ -863,7 +850,7 @@ export class SyncEngine {
 			result = await this.drive.listChanges(token);
 		} catch (e) {
 			if (e instanceof ApiError && [400, 404, 410].includes(e.status)) {
-				new Notice("GDSync: The change token has expired. Running a full scan.");
+				new Notice(t.changeTokenExpired);
 				await this.fullScan();
 				return;
 			}
@@ -1064,7 +1051,7 @@ export class SyncEngine {
 		if (this.syncing || this.scanning) return;
 		this.syncing = true;
 		try {
-			this.status.set("Syncing…");
+			this.status.set(t.syncing);
 			await this.flushPendingOps();
 			await this.tryEnsureRemoteFolders();
 			for (const rel of this.index.dirtyPaths()) this.queue.schedule(rel, true);
@@ -1072,7 +1059,7 @@ export class SyncEngine {
 			this.status.set("");
 		} catch (e) {
 			this.status.set("");
-			if (!(e instanceof NetworkError)) this.notifyError("Sync failed", e);
+			if (!(e instanceof NetworkError)) this.notifyError(t.syncFailed, e);
 		} finally {
 			this.syncing = false;
 		}
@@ -1125,7 +1112,7 @@ export class SyncEngine {
 		if (e instanceof AuthError) {
 			new Notice(`GDSync: ${e.message}`, 15000);
 		} else if (e instanceof NetworkError) {
-			new Notice(`GDSync: ${prefix} (possibly offline)\n${detail}`, 15000);
+			new Notice(`GDSync: ${prefix} (${t.possiblyOffline})\n${detail}`, 15000);
 		} else if (e instanceof ApiError) {
 			new Notice(`GDSync: ${prefix} (HTTP ${e.status})\n${e.message}`, 15000);
 		} else {

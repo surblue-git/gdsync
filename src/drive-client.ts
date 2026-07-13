@@ -1,5 +1,6 @@
 import { requestUrl, RequestUrlParam, RequestUrlResponse } from "obsidian";
 import { AuthManager } from "./auth";
+import { t } from "./i18n";
 import { DriveChange, DriveItemMeta } from "./types";
 
 const API = "https://www.googleapis.com/drive/v3";
@@ -87,7 +88,7 @@ export class DriveClient {
 				return await requestUrl({ ...params, headers, throw: false });
 			} catch (e) {
 				throw new NetworkError(
-					`Network error: ${e instanceof Error ? e.message : String(e)}`
+					t.networkError(e instanceof Error ? e.message : String(e))
 				);
 			}
 		};

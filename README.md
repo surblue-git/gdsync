@@ -76,6 +76,8 @@ Copy the generated `main.js`, `manifest.json`, and `styles.css` into `<vault>/.o
 1. *Choose from list* to pick the Drive folder to sync (pasting a Drive URL also works)
 2. *Run full scan* → the stub tree is created under `GDrive/`
 
+The plugin UI is available in **English and Japanese**, following Obsidian's display-language setting.
+
 ## Daily use
 
 - Open a file → it is downloaded on the spot (subsequent opens use the cache; remote updates are re-fetched)
