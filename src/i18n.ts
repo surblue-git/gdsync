@@ -1,15 +1,38 @@
+import { moment } from "obsidian";
+
 /**
- * 軽量な i18n。Obsidian の表示言語（localStorage の "language"）を見て
- * 英語 / 日本語を切り替える。言語変更には Obsidian の再起動が要るため、
- * 読み込み時に一度だけ判定すれば十分。
+ * 軽量な i18n。Obsidian の表示言語を見て英語 / 日本語を切り替える。
+ * 言語変更には Obsidian の再起動が要るため、読み込み時に一度だけ判定すれば十分。
+ *
+ * 表示言語の取得元は環境で異なる（特にモバイルでは localStorage の "language" が
+ * 空のことがある）ため、複数ソースを順に見る:
+ *   1. localStorage "language" … ユーザーが明示設定した Obsidian の表示言語
+ *   2. moment.locale()          … Obsidian が表示言語に合わせて設定する日付ロケール
+ *   3. navigator.language       … 端末の言語（最後の砦）
  */
+function isJa(v: string | null | undefined): boolean {
+	return !!v && v.toLowerCase().startsWith("ja");
+}
 
 function detectLang(): "ja" | "en" {
+	// 1. 明示設定があればそれを尊重（ja 以外なら英語扱い）
 	try {
 		const l = window.localStorage.getItem("language");
-		if (l && l.toLowerCase().startsWith("ja")) return "ja";
+		if (l) return isJa(l) ? "ja" : "en";
 	} catch (e) {
-		/* localStorage 不可の環境では英語 */
+		/* localStorage 不可 */
+	}
+	// 2. 明示設定なし（英語既定 or モバイルの空）→ Obsidian のロケール
+	try {
+		if (isJa(moment.locale())) return "ja";
+	} catch (e) {
+		/* moment 不可 */
+	}
+	// 3. 端末の言語
+	try {
+		if (isJa(navigator?.language)) return "ja";
+	} catch (e) {
+		/* navigator 不可 */
 	}
 	return "en";
 }
