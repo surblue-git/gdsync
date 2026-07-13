@@ -18,7 +18,6 @@ export default class GdsyncPlugin extends Plugin {
 	status!: StatusDisplay;
 
 	async onload(): Promise<void> {
-		console.log(`gdsync: loading v${this.manifest.version}`);
 		await this.loadSettings();
 
 		this.auth = new AuthManager(this);
@@ -37,27 +36,27 @@ export default class GdsyncPlugin extends Plugin {
 
 		this.addCommand({
 			id: "authenticate",
-			name: "Google 認証を開始",
+			name: "Authenticate with Google",
 			callback: () => void this.auth.beginAuth(),
 		});
 		this.addCommand({
 			id: "full-scan",
-			name: "フルスキャン（インデックス構築/更新）",
+			name: "Full scan (build or update index)",
 			callback: () => void this.engine.fullScan(),
 		});
 		this.addCommand({
 			id: "sync-now",
-			name: "今すぐ同期",
+			name: "Sync now",
 			callback: () => void this.engine.syncNow(),
 		});
 		this.addCommand({
 			id: "evict-cache",
-			name: "キャッシュ整理（古い実体を解放）",
+			name: "Clean up cache (release old content)",
 			callback: () => void this.engine.evictCache(),
 		});
 		this.addCommand({
 			id: "hydrate-current",
-			name: "現在のファイルを再ダウンロード",
+			name: "Re-download current file",
 			checkCallback: (checking) => {
 				const file = this.app.workspace.getActiveFile();
 				if (!file) return false;
@@ -76,7 +75,7 @@ export default class GdsyncPlugin extends Plugin {
 		});
 		this.addCommand({
 			id: "upload-current",
-			name: "現在のファイルを今すぐアップロード",
+			name: "Upload current file now",
 			checkCallback: (checking) => {
 				const file = this.app.workspace.getActiveFile();
 				if (!file) return false;
@@ -92,7 +91,7 @@ export default class GdsyncPlugin extends Plugin {
 			},
 		});
 
-		this.addRibbonIcon("refresh-cw", "GDSync: 今すぐ同期", () =>
+		this.addRibbonIcon("refresh-cw", "GDSync: Sync now", () =>
 			void this.engine.syncNow()
 		);
 
@@ -170,16 +169,15 @@ export default class GdsyncPlugin extends Plugin {
 			if (await adapter.exists(marker)) return;
 			if (!(await adapter.exists(base))) await adapter.mkdir(base);
 			await adapter.write(marker, "");
-			console.log(`gdsync: created ${marker} (MediaStore から除外)`);
 		} catch (e) {
-			console.warn("gdsync: .nomedia の作成に失敗", e);
+			console.warn("gdsync: failed to create .nomedia", e);
 		}
 	}
 
 	/** 認証成功直後のフック */
 	onAuthenticated(): void {
 		if (!this.settings.rootFolderId) {
-			new Notice("GDSync: 次に設定画面で同期対象の Drive フォルダを選択してください。");
+			new Notice("GDSync: Next, choose the Google Drive folder to sync in the settings tab.");
 		}
 	}
 
@@ -191,6 +189,7 @@ export default class GdsyncPlugin extends Plugin {
 	}
 
 	onunload(): void {
+		this.auth.dispose();
 		this.engine.queue.clear();
 		void this.index.flush();
 	}

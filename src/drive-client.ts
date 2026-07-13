@@ -87,7 +87,7 @@ export class DriveClient {
 				return await requestUrl({ ...params, headers, throw: false });
 			} catch (e) {
 				throw new NetworkError(
-					`ネットワークエラー: ${e instanceof Error ? e.message : String(e)}`
+					`Network error: ${e instanceof Error ? e.message : String(e)}`
 				);
 			}
 		};

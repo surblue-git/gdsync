@@ -1,6 +1,7 @@
 import {
 	App,
 	FuzzySuggestModal,
+	Modal,
 	Notice,
 	PluginSettingTab,
 	Setting,
@@ -21,7 +22,7 @@ class DriveFolderSuggestModal extends FuzzySuggestModal<FolderChoice> {
 		private onChoose: (c: FolderChoice) => void
 	) {
 		super(app);
-		this.setPlaceholder("同期対象の Drive フォルダを検索…");
+		this.setPlaceholder("Search for the Drive folder to sync…");
 	}
 
 	getItems(): FolderChoice[] {
@@ -58,6 +59,40 @@ function extractFolderId(input: string): string {
 	return input.trim();
 }
 
+/** 接続コード貼り付け用モーダル */
+class ConnectionCodeModal extends Modal {
+	constructor(app: App, private onSubmit: (code: string) => void) {
+		super(app);
+	}
+
+	onOpen(): void {
+		const { contentEl } = this;
+		this.setTitle("Enter connection code");
+		contentEl.createEl("p", {
+			text: "Paste the connection code copied from your other device. It contains your credentials — delete it from wherever you sent it after connecting.",
+		});
+		const ta = contentEl.createEl("textarea", {
+			cls: "gdsync-connection-code",
+		});
+		ta.rows = 6;
+		new Setting(contentEl).addButton((btn) =>
+			btn
+				.setButtonText("Connect")
+				.setCta()
+				.onClick(() => {
+					const v = ta.value.trim();
+					if (!v) return;
+					this.close();
+					this.onSubmit(v);
+				})
+		);
+	}
+
+	onClose(): void {
+		this.contentEl.empty();
+	}
+}
+
 export class GdsyncSettingTab extends PluginSettingTab {
 	constructor(app: App, private plugin: GdsyncPlugin) {
 		super(app, plugin);
@@ -69,97 +104,126 @@ export class GdsyncSettingTab extends PluginSettingTab {
 		const s = this.plugin.settings;
 
 		// バージョン表示（新しいビルドが読み込まれているか確認用）
-		const ver = containerEl.createEl("p", {
+		containerEl.createEl("p", {
 			text: `GDSync v${this.plugin.manifest.version}`,
+			cls: "gdsync-version",
 		});
-		ver.style.opacity = "0.6";
-		ver.style.fontSize = "0.85em";
-		ver.style.margin = "0 0 8px";
 
 		// ---------- Google 認証 ----------
-		new Setting(containerEl).setName("Google 認証").setHeading();
+		new Setting(containerEl).setName("Google authentication").setHeading();
 
 		new Setting(containerEl)
-			.setName("クライアントID")
-			.setDesc("自分の Google Cloud プロジェクトの OAuth クライアントID（Webアプリケーション型）")
+			.setName("Client ID")
+			.setDesc("OAuth client ID from your own Google Cloud project (Desktop app type recommended).")
 			.addText((text) => {
 				text.setValue(s.clientId).onChange(async (v) => {
 					s.clientId = v.trim();
 					await this.plugin.saveSettings();
 				});
-				text.inputEl.style.width = "100%";
+				text.inputEl.addClass("gdsync-wide-input");
 			});
 
 		new Setting(containerEl)
-			.setName("クライアントシークレット")
+			.setName("Client secret")
+			.setDesc("Stored unencrypted in this vault's plugin data. Use a dedicated Google Cloud project.")
 			.addText((text) => {
 				text.setValue(s.clientSecret).onChange(async (v) => {
 					s.clientSecret = v.trim();
 					await this.plugin.saveSettings();
 				});
 				text.inputEl.type = "password";
-				text.inputEl.style.width = "100%";
+				text.inputEl.addClass("gdsync-wide-input");
 			});
 
 		new Setting(containerEl)
-			.setName("リダイレクトURI")
-			.setDesc("Cloudflare Pages 等にデプロイした redirect-page のURL。GCP側のリダイレクトURIにも同じ値を登録すること")
+			.setName("Redirect URI (optional)")
+			.setDesc("Only needed for browser sign-in directly on mobile. Leave empty if you sign in on desktop and connect this device with a connection code. If used, deploy the redirect page and register its URL in Google Cloud.")
 			.addText((text) => {
-				text.setPlaceholder("https://gdsync-auth.pages.dev/")
+				text.setPlaceholder("https://example.github.io/gdsync/")
 					.setValue(s.redirectUri)
 					.onChange(async (v) => {
 						s.redirectUri = v.trim();
 						await this.plugin.saveSettings();
 					});
-				text.inputEl.style.width = "100%";
+				text.inputEl.addClass("gdsync-wide-input");
 			});
 
 		const authStatus = s.tokens
-			? "認証済み"
+			? "authenticated"
 			: s.pendingAuth
-				? "ブラウザでの認証待ち…"
-				: "未認証";
+				? "waiting for browser…"
+				: "not authenticated";
 		new Setting(containerEl)
-			.setName(`認証状態: ${authStatus}`)
+			.setName(`Status: ${authStatus}`)
 			.addButton((btn) =>
 				btn
-					.setButtonText(s.tokens ? "再認証" : "Google 認証を開始")
+					.setButtonText(s.tokens ? "Re-authenticate" : "Authenticate with Google")
 					.setCta()
 					.onClick(() => void this.plugin.auth.beginAuth())
 			)
 			.addButton((btn) =>
-				btn.setButtonText("接続テスト").onClick(async () => {
+				btn.setButtonText("Test connection").onClick(async () => {
 					try {
 						const user = await this.plugin.drive.about();
 						new Notice(
-							`GDSync: 接続OK — ${user.displayName} (${user.emailAddress})`
+							`GDSync: Connected — ${user.displayName} (${user.emailAddress})`
 						);
 					} catch (e) {
 						new Notice(
-							`GDSync: 接続テスト失敗 — ${e instanceof Error ? e.message : String(e)}`
+							`GDSync: Connection test failed — ${e instanceof Error ? e.message : String(e)}`
 						);
 					}
 				})
 			)
 			.addButton((btn) =>
-				btn.setButtonText("ログアウト").setWarning().onClick(async () => {
+				btn.setButtonText("Log out").setWarning().onClick(async () => {
 					await this.plugin.auth.logout();
 					this.display();
 				})
 			);
 
+		const connDesc = new Setting(containerEl)
+			.setName("Connection code")
+			.setDesc(
+				"Moves this authentication to another device (e.g. sign in on desktop, then paste the code on your phone). The code contains your credentials and tokens — treat it like a password and delete it after use."
+			);
+		if (s.tokens) {
+			connDesc.addButton((btn) =>
+				btn.setButtonText("Copy code").onClick(async () => {
+					const code = this.plugin.auth.exportConnectionCode();
+					if (!code) {
+						new Notice("GDSync: Authenticate first.");
+						return;
+					}
+					await navigator.clipboard.writeText(code);
+					new Notice(
+						"GDSync: Connection code copied. Treat it like a password."
+					);
+				})
+			);
+		}
+		connDesc.addButton((btn) =>
+			btn.setButtonText("Enter code").onClick(() => {
+				new ConnectionCodeModal(this.app, (code) => {
+					void this.plugin.auth.importConnectionCode(code).then((ok) => {
+						if (ok) this.display();
+					});
+				}).open();
+			})
+		);
+
 		// ---------- 同期対象 ----------
-		new Setting(containerEl).setName("同期対象").setHeading();
+		new Setting(containerEl).setName("Sync target").setHeading();
 
 		new Setting(containerEl)
-			.setName("Drive フォルダ")
+			.setName("Drive folder")
 			.setDesc(
 				s.rootFolderName
-					? `選択中: ${s.rootFolderName} (${s.rootFolderId})`
-					: "Vault として扱う Drive 上のフォルダ。URL 貼り付けでも可"
+					? `Selected: ${s.rootFolderName} (${s.rootFolderId})`
+					: "The Google Drive folder to treat as the vault mirror. You can also paste a Drive URL."
 			)
 			.addText((text) => {
-				text.setPlaceholder("フォルダID または DriveのURL")
+				text.setPlaceholder("Folder ID or Drive URL")
 					.setValue(s.rootFolderId)
 					.onChange(async (v) => {
 						s.rootFolderId = extractFolderId(v);
@@ -168,9 +232,9 @@ export class GdsyncSettingTab extends PluginSettingTab {
 					});
 			})
 			.addButton((btn) =>
-				btn.setButtonText("一覧から選択").onClick(async () => {
+				btn.setButtonText("Choose from list").onClick(async () => {
 					try {
-						new Notice("GDSync: フォルダ一覧を取得中…");
+						new Notice("GDSync: Fetching folder list…");
 						const folders = await this.plugin.drive.listAllFolders();
 						const choices = buildFolderChoices(folders);
 						new DriveFolderSuggestModal(this.app, choices, async (c) => {
@@ -181,15 +245,15 @@ export class GdsyncSettingTab extends PluginSettingTab {
 						}).open();
 					} catch (e) {
 						new Notice(
-							`GDSync: フォルダ一覧の取得に失敗 — ${e instanceof Error ? e.message : String(e)}`
+							`GDSync: Failed to fetch folder list — ${e instanceof Error ? e.message : String(e)}`
 						);
 					}
 				})
 			);
 
 		new Setting(containerEl)
-			.setName("ミラー先ベースフォルダ")
-			.setDesc("Vault 内でこのフォルダ配下に Drive の構造を再現します")
+			.setName("Mirror base folder")
+			.setDesc("The Drive folder structure is recreated under this folder in your vault.")
 			.addText((text) =>
 				text.setValue(s.baseFolder).onChange(async (v) => {
 					s.baseFolder = v.trim() || "GDrive";
@@ -198,8 +262,8 @@ export class GdsyncSettingTab extends PluginSettingTab {
 			);
 
 		new Setting(containerEl)
-			.setName("除外パターン")
-			.setDesc("1行1パターン。パスに部分一致したものは同期しません")
+			.setName("Exclude patterns")
+			.setDesc("One pattern per line. Paths containing a pattern are not synced.")
 			.addTextArea((ta) => {
 				ta.setValue(s.excludePatterns).onChange(async (v) => {
 					s.excludePatterns = v;
@@ -209,21 +273,21 @@ export class GdsyncSettingTab extends PluginSettingTab {
 			});
 
 		new Setting(containerEl)
-			.setName("インデックス構築 / 更新（フルスキャン）")
-			.setDesc("Drive の一覧を取得し、フォルダ構造とスタブを作成します")
+			.setName("Build or update index (full scan)")
+			.setDesc("Lists your Drive files and creates the folder structure and stub files.")
 			.addButton((btn) =>
 				btn
-					.setButtonText("フルスキャン実行")
+					.setButtonText("Run full scan")
 					.setCta()
 					.onClick(() => void this.plugin.engine.fullScan())
 			);
 
 		// ---------- 動作設定 ----------
-		new Setting(containerEl).setName("動作設定").setHeading();
+		new Setting(containerEl).setName("Behavior").setHeading();
 
 		new Setting(containerEl)
-			.setName("最大ファイルサイズ (MB)")
-			.setDesc("これを超えるファイルはダウンロードしません")
+			.setName("Maximum file size (MB)")
+			.setDesc("Files larger than this are not downloaded.")
 			.addText((text) =>
 				text.setValue(String(s.maxFileSizeMB)).onChange(async (v) => {
 					const n = parseInt(v, 10);
@@ -235,8 +299,8 @@ export class GdsyncSettingTab extends PluginSettingTab {
 			);
 
 		new Setting(containerEl)
-			.setName("アップロードまでの待ち時間 (秒)")
-			.setDesc("編集が止まってからアップロードするまでのデバウンス")
+			.setName("Upload debounce (seconds)")
+			.setDesc("How long to wait after you stop editing before uploading.")
 			.addText((text) =>
 				text.setValue(String(s.uploadDebounceSec)).onChange(async (v) => {
 					const n = parseInt(v, 10);
@@ -248,8 +312,8 @@ export class GdsyncSettingTab extends PluginSettingTab {
 			);
 
 		new Setting(containerEl)
-			.setName("鮮度確認の間隔 (分)")
-			.setDesc("キャッシュ済みファイルを開いたときにリモート更新を確認する間隔")
+			.setName("Freshness check interval (minutes)")
+			.setDesc("How often to check for remote updates when opening a cached file.")
 			.addText((text) =>
 				text.setValue(String(s.freshnessTtlMin)).onChange(async (v) => {
 					const n = parseInt(v, 10);
@@ -261,8 +325,8 @@ export class GdsyncSettingTab extends PluginSettingTab {
 			);
 
 		new Setting(containerEl)
-			.setName("キャッシュ保持日数")
-			.setDesc("この日数開いていないファイルの実体を解放（スタブに戻す）")
+			.setName("Cache retention (days)")
+			.setDesc("Files not opened for this many days are released back to stubs.")
 			.addText((text) =>
 				text.setValue(String(s.cacheMaxAgeDays)).onChange(async (v) => {
 					const n = parseInt(v, 10);
@@ -274,8 +338,8 @@ export class GdsyncSettingTab extends PluginSettingTab {
 			);
 
 		new Setting(containerEl)
-			.setName("キャッシュ最大件数")
-			.setDesc("実体を保持するファイル数の上限（超過分は古い順に解放）")
+			.setName("Cache maximum count")
+			.setDesc("Maximum number of files kept with content (oldest are released first).")
 			.addText((text) =>
 				text.setValue(String(s.cacheMaxCount)).onChange(async (v) => {
 					const n = parseInt(v, 10);
@@ -287,8 +351,8 @@ export class GdsyncSettingTab extends PluginSettingTab {
 			);
 
 		new Setting(containerEl)
-			.setName("デスクトップでも有効にする")
-			.setDesc("通常は不要（PCは Google Drive for Desktop の同期フォルダを使う想定）")
+			.setName("Enable on desktop")
+			.setDesc("Usually unnecessary — on desktop, use a Google Drive for Desktop synced folder as the vault instead.")
 			.addToggle((toggle) =>
 				toggle.setValue(s.enableOnDesktop).onChange(async (v) => {
 					s.enableOnDesktop = v;
@@ -297,43 +361,43 @@ export class GdsyncSettingTab extends PluginSettingTab {
 			);
 
 		// ---------- メンテナンス ----------
-		new Setting(containerEl).setName("メンテナンス").setHeading();
+		new Setting(containerEl).setName("Maintenance").setHeading();
 
 		new Setting(containerEl)
-			.setName("今すぐ同期")
-			.setDesc("保留中のアップロード・構造変更を送信し、リモート差分を取得します")
+			.setName("Sync now")
+			.setDesc("Sends pending uploads and structure changes, then fetches remote changes.")
 			.addButton((btn) =>
-				btn.setButtonText("同期").onClick(() => void this.plugin.engine.syncNow())
+				btn.setButtonText("Sync").onClick(() => void this.plugin.engine.syncNow())
 			);
 
 		new Setting(containerEl)
-			.setName("キャッシュ整理")
-			.setDesc("古いキャッシュ（実体）を解放してスタブに戻します")
+			.setName("Clean up cache")
+			.setDesc("Releases old cached content back to stub files.")
 			.addButton((btn) =>
-				btn.setButtonText("実行").onClick(async () => {
+				btn.setButtonText("Run").onClick(async () => {
 					await this.plugin.engine.evictCache();
-					new Notice("GDSync: キャッシュ整理が完了しました。");
+					new Notice("GDSync: Cache cleanup finished.");
 				})
 			);
 
 		new Setting(containerEl)
-			.setName("インデックスをリセット")
+			.setName("Reset index")
 			.setDesc(
-				"未アップロードの編集がある場合は先に同期してください。実行後は「フルスキャン実行」で作り直してください。"
+				"Sync first if you have unsent edits. After resetting, run a full scan to rebuild."
 			)
 			.addButton((btn) =>
-				btn.setWarning().setButtonText("リセット").onClick(async () => {
+				btn.setWarning().setButtonText("Reset").onClick(async () => {
 					const dirty = this.plugin.index.dirtyPaths().length;
 					if (dirty > 0) {
 						new Notice(
-							`GDSync: 未アップロードの編集が${dirty}件あります。先に「今すぐ同期」を実行してください。`
+							`GDSync: ${dirty} edit(s) have not been uploaded yet. Run "Sync now" first.`
 						);
 						return;
 					}
 					this.plugin.index.reset(s.rootFolderId);
 					await this.plugin.index.flush();
 					new Notice(
-						"GDSync: インデックスをリセットしました。「フルスキャン実行」で作り直してください。"
+						"GDSync: Index has been reset. Run a full scan to rebuild it."
 					);
 				})
 			);

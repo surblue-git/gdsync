@@ -1,4 +1,4 @@
-import { Notice, TFile, TFolder, normalizePath } from "obsidian";
+import { FileView, Notice, TFile, TFolder, normalizePath } from "obsidian";
 import { AuthError } from "./auth";
 import {
 	ApiError,
@@ -146,8 +146,9 @@ export class SyncEngine {
 		const vaultPath = this.toVault(rel);
 		let open = false;
 		this.plugin.app.workspace.iterateAllLeaves((leaf) => {
-			const view = leaf.view as unknown as { file?: { path?: string } };
-			if (view?.file?.path === vaultPath) open = true;
+			if (leaf.view instanceof FileView && leaf.view.file?.path === vaultPath) {
+				open = true;
+			}
 		});
 		return open;
 	}
@@ -161,20 +162,20 @@ export class SyncEngine {
 	async fullScan(): Promise<void> {
 		const s = this.plugin.settings;
 		if (!s.rootFolderId) {
-			new Notice("GDSync: 対象の Drive フォルダが未設定です。");
+			new Notice("GDSync: No Google Drive folder has been selected.");
 			return;
 		}
 		if (this.scanning) {
-			new Notice("GDSync: スキャンは既に実行中です。");
+			new Notice("GDSync: A scan is already running.");
 			return;
 		}
 		this.scanning = true;
 		try {
-			this.status.progress("Drive 一覧を取得中…");
+			this.status.progress("Listing Drive files…");
 			// リスト取得前にトークンを確保 → スキャン中の変更を取りこぼさない
 			const startToken = await this.drive.getStartPageToken();
 			const items = await this.drive.listAll((count) =>
-				this.status.progress(`Drive 一覧を取得中… ${count} 件`)
+				this.status.progress(`Listing Drive files… ${count}`)
 			);
 
 			// parents ポインタからツリー再構成（BFS）
@@ -229,19 +230,19 @@ export class SyncEngine {
 			}
 
 			// 診断ログ（開発者コンソール用）
-			console.log(
-				`gdsync: fullScan — Drive総アイテム=${items.length}, ` +
-					`対象フォルダ=${remoteFolders.size}, 対象ファイル=${remoteFiles.size}`
+			console.debug(
+				`gdsync: fullScan — total items=${items.length}, ` +
+					`folders=${remoteFolders.size}, files=${remoteFiles.size}`
 			);
 			if (remoteFiles.size === 0 && remoteFolders.size > 0) {
 				new Notice(
-					"GDSync: フォルダは見つかりましたが同期対象ファイルが0件でした。除外パターンや対象フォルダ設定を確認してください。",
+					"GDSync: Folders were found but no files matched. Check the exclude patterns and the selected Drive folder.",
 					15000
 				);
 			}
 
 			// --- ローカルへ反映 ---
-			this.status.progress("フォルダを作成中…");
+			this.status.progress("Creating folders…");
 			await this.ops.ensureFolder(this.basePath());
 			const sortedFolders = Array.from(remoteFolders.keys()).sort(
 				(a, b) => a.split("/").length - b.split("/").length
@@ -317,10 +318,10 @@ export class SyncEngine {
 					if (!firstError) {
 						firstError = `${rel}: ${e instanceof Error ? e.message : String(e)}`;
 					}
-					console.error("gdsync: スタブ作成失敗", rel, e);
+					console.error("gdsync: failed to create stub", rel, e);
 				}
 				if (i % 50 === 0) {
-					this.status.progress(`スタブ作成中… ${i}/${remoteFiles.size}`);
+					this.status.progress(`Creating stubs… ${i}/${remoteFiles.size}`);
 					await yieldToUI();
 				}
 			}
@@ -360,18 +361,18 @@ export class SyncEngine {
 			this.status.endProgress();
 			if (failed > 0) {
 				new Notice(
-					`GDSync: スキャン完了（${remoteFiles.size}ファイル中 ${created}件作成、${failed}件失敗）\n最初の失敗: ${firstError}`,
+					`GDSync: Scan finished (${created} of ${remoteFiles.size} files created, ${failed} failed)\nFirst failure: ${firstError}`,
 					15000
 				);
 			} else {
 				new Notice(
-					`GDSync: スキャン完了 (${remoteFiles.size} ファイル / 新規スタブ ${created})`,
+					`GDSync: Scan finished (${remoteFiles.size} files / ${created} new stubs)`,
 					8000
 				);
 			}
 		} catch (e) {
 			this.status.endProgress();
-			this.notifyError("スキャン失敗", e);
+			this.notifyError("Scan failed", e);
 		} finally {
 			this.scanning = false;
 		}
@@ -390,7 +391,7 @@ export class SyncEngine {
 		await this.withLock(rel, async () => {
 			if (entry.tooLarge) {
 				new Notice(
-					`GDSync: ${file.name} はサイズ上限(${this.plugin.settings.maxFileSizeMB}MB)を超えるため取得しません。`
+					`GDSync: ${file.name} exceeds the size limit (${this.plugin.settings.maxFileSizeMB} MB) and will not be downloaded.`
 				);
 				return;
 			}
@@ -427,10 +428,10 @@ export class SyncEngine {
 		if (entry.remoteSize > maxSize) {
 			entry.tooLarge = true;
 			this.index.markDirty();
-			new Notice(`GDSync: ${file.name} はサイズ上限を超えるため取得しません。`);
+			new Notice(`GDSync: ${file.name} exceeds the size limit and will not be downloaded.`);
 			return false;
 		}
-		this.status.set(`${file.name} を取得中…`);
+		this.status.set(`Downloading ${file.name}…`);
 		try {
 			const data = await this.drive.download(entry.fileId);
 			await this.ops.writeContent(file, data);
@@ -443,7 +444,7 @@ export class SyncEngine {
 			await this.index.flush();
 			return true;
 		} catch (e) {
-			this.notifyError(`${file.name} の取得に失敗`, e);
+			this.notifyError(`Failed to download ${file.name}`, e);
 			return false;
 		} finally {
 			this.status.set("");
@@ -465,7 +466,7 @@ export class SyncEngine {
 		if (!entry.hydrated && entry.fileId) {
 			// ガード1: 未ハイドレートのスタブ編集はアップロードさせない
 			new Notice(
-				"GDSync: このファイルの実体はまだ取得されていません。この編集はアップロードされません。オンラインでファイルを開き直してください。"
+				"GDSync: This file's content has not been downloaded yet, so this edit will not be uploaded. Reopen the file while online first."
 			);
 			return;
 		}
@@ -661,7 +662,7 @@ export class SyncEngine {
 			// ガード3: ローカルが空でリモートに内容がある場合は事故防止のため送らない
 			if (data.byteLength === 0 && entry.remoteSize > 0) {
 				new Notice(
-					`GDSync: ${file.name} が空のためアップロードを中止しました（リモートには内容があります）。意図的なら一度リモート版を開いてから編集してください。`
+					`GDSync: Upload of ${file.name} was cancelled because it is empty while the remote copy has content. If this is intentional, open the remote version once and then edit it.`
 				);
 				return true;
 			}
@@ -727,10 +728,10 @@ export class SyncEngine {
 					return true; // 再認証されるまでリトライしない（dirty は残る）
 				}
 				if (e instanceof NetworkError) {
-					this.status.set("オフライン（アップロード待機中）");
+					this.status.set("Offline (upload pending)");
 					return false; // バックオフでリトライ
 				}
-				this.notifyError(`${file.name} のアップロードに失敗`, e);
+				this.notifyError(`Failed to upload ${file.name}`, e);
 				return false;
 			}
 		});
@@ -780,7 +781,7 @@ export class SyncEngine {
 		entry.dirty = false;
 		await this.downloadInto(file, entry);
 		new Notice(
-			`GDSync: 競合を検出しました。ローカル版を「${conflictName}」として保存し、${file.name} はリモート版に更新しました。`
+			`GDSync: Conflict detected. The local version was saved as "${conflictName}" and ${file.name} was updated to the remote version.`
 		);
 	}
 
@@ -862,7 +863,7 @@ export class SyncEngine {
 			result = await this.drive.listChanges(token);
 		} catch (e) {
 			if (e instanceof ApiError && [400, 404, 410].includes(e.status)) {
-				new Notice("GDSync: 差分トークンが失効しました。フルスキャンを実行します。");
+				new Notice("GDSync: The change token has expired. Running a full scan.");
 				await this.fullScan();
 				return;
 			}
@@ -877,7 +878,7 @@ export class SyncEngine {
 			try {
 				await this.applyChange(c);
 			} catch (e) {
-				console.error("gdsync: change適用失敗", c.fileId, e);
+				console.error("gdsync: failed to apply change", c.fileId, e);
 			}
 		}
 		this.index.data.changesPageToken = result.newStartPageToken;
@@ -1063,7 +1064,7 @@ export class SyncEngine {
 		if (this.syncing || this.scanning) return;
 		this.syncing = true;
 		try {
-			this.status.set("同期中…");
+			this.status.set("Syncing…");
 			await this.flushPendingOps();
 			await this.tryEnsureRemoteFolders();
 			for (const rel of this.index.dirtyPaths()) this.queue.schedule(rel, true);
@@ -1071,7 +1072,7 @@ export class SyncEngine {
 			this.status.set("");
 		} catch (e) {
 			this.status.set("");
-			if (!(e instanceof NetworkError)) this.notifyError("同期に失敗", e);
+			if (!(e instanceof NetworkError)) this.notifyError("Sync failed", e);
 		} finally {
 			this.syncing = false;
 		}
@@ -1124,7 +1125,7 @@ export class SyncEngine {
 		if (e instanceof AuthError) {
 			new Notice(`GDSync: ${e.message}`, 15000);
 		} else if (e instanceof NetworkError) {
-			new Notice(`GDSync: ${prefix}（オフラインの可能性）\n${detail}`, 15000);
+			new Notice(`GDSync: ${prefix} (possibly offline)\n${detail}`, 15000);
 		} else if (e instanceof ApiError) {
 			new Notice(`GDSync: ${prefix} (HTTP ${e.status})\n${e.message}`, 15000);
 		} else {

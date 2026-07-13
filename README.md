@@ -1,86 +1,111 @@
-# GDSync — Google Drive オンデマンド同期（Obsidianプラグイン）
+# GDSync — on-demand Google Drive sync for Obsidian
 
-モバイル（iOS/Android）の Obsidian から Google Drive 上の Vault データを**オンデマンド**で読み書きするプラグインです。
+[日本語版 README はこちら / Japanese README](README.ja.md)
 
-- Drive のフォルダ/ファイル構造を Vault 内の `GDrive/`（変更可）に **0バイトのスタブ**として再現 → Obsidian 標準のファイルエクスプローラー/クイックスイッチャーがそのまま使える
-- ファイルを**開いた時**に Drive から実体をダウンロード（ハイドレート）
-- **編集すると自動アップロード**（デバウンス数秒、`modifiedTime` による競合検出 → 競合時は `(conflict …)` コピーを作成）
-- 一度開いたファイルはローカルにキャッシュ。古いキャッシュは自動でスタブに戻る
-- 作成 / リネーム / 削除も Drive に反映（削除は Drive のゴミ箱へ）
-- PC 側は Google Drive for Desktop で同じフォルダを Vault にすれば OK（このプラグインは既定でモバイルのみ動作）
+GDSync lets Obsidian on mobile (iOS/Android) read and write a vault stored in Google Drive **on demand**, without downloading the whole vault first.
 
-## セットアップ
+- Mirrors the folder/file structure of a Drive folder into your vault (default `GDrive/`) as **zero-byte stub files** — Obsidian's file explorer and quick switcher work as usual
+- Downloads a file's content **when you open it** (hydration)
+- **Uploads edits automatically** (debounced a few seconds; conflicts are detected via checksums and preserved as `(conflict …)` copies)
+- Files you have opened stay cached locally; old cache entries are automatically released back to stubs
+- Create / rename / delete are propagated to Drive (deletions go to the Drive **trash**, never permanently deleted)
+- On desktop, point your vault at a Google Drive for Desktop synced folder instead (the plugin is mobile-only by default)
 
-### 1. Google Cloud プロジェクト（自分専用）
+## How it differs from other sync plugins
 
-1. [Google Cloud Console](https://console.cloud.google.com/) でプロジェクト作成
-2. 「APIとサービス」→「ライブラリ」→ **Google Drive API を有効化**
-3. 「OAuth 同意画面」: User Type = **外部**、スコープに `https://www.googleapis.com/auth/drive` を追加
-4. 公開ステータスを **「本番」に移行**（テストのままだとリフレッシュトークンが7日で失効する）。未検証アプリ警告は自分のアカウントなら「詳細」→「（安全でないページに）移動」で通過できる
-5. 「認証情報」→ OAuth クライアントID作成 → 種類 = **ウェブアプリケーション**、承認済みリダイレクトURIに **手順2でデプロイするページのURL** を登録
+Existing community plugins (e.g. *Google Drive Sync*, *Remotely Save*) replicate the **entire** remote vault locally. GDSync instead keeps only a lightweight stub tree and fetches file content lazily, so it works well for large vaults (many GB of PDFs/images) on phones with limited storage. It is an *on-demand cache*, not a full replica.
 
-### 2. リダイレクトページのデプロイ
+## Requirements, network use, and privacy disclosure
 
-`redirect-page/index.html` を Cloudflare Pages（や GitHub Pages 等の静的ホスティング）にデプロイします。認可コードを `obsidian://gdsync-auth` へ転送するだけの静的ページで、シークレットは扱いません。
+- **Account required:** a Google account and your **own** Google Cloud OAuth client (free). GDSync ships no developer credentials; you authenticate against your own Google Cloud project.
+- **Network:** the plugin talks only to Google endpoints — `accounts.google.com`, `oauth2.googleapis.com`, and `www.googleapis.com` (Drive API). There is no third-party server and no telemetry.
+- **Scope:** GDSync requests the full `https://www.googleapis.com/auth/drive` scope. The narrower `drive.file` scope is not sufficient because the plugin must read files created by other apps (e.g. Google Drive for Desktop). Because it is your own OAuth client, only your account can use it.
+- **Full-Drive listing:** to build the mirror index, the plugin lists file *metadata* (names, IDs, checksums) of your My Drive. File *content* is downloaded only for files you open, inside the selected folder.
+- **Credential storage:** the OAuth client ID/secret and tokens are stored **unencrypted** in the plugin's `data.json` inside your vault, like most sync plugins. Do not share your vault's `.obsidian` folder, and use a dedicated Google Cloud project so the credentials cannot affect anything else.
+- **Clipboard:** written to exactly once, when you click *Copy code* to move your sign-in to another device. The plugin never reads the clipboard. The connection code contains your tokens — treat it like a password and delete it from wherever you sent it after use.
+- **Local port:** during desktop sign-in the plugin briefly listens on `127.0.0.1:42813` (loopback only, never exposed to the network) to receive the OAuth redirect, then closes it.
 
-デプロイしたURLを GCP のリダイレクトURIとプラグイン設定の両方に設定してください。
+## Setup
 
-### 3. プラグインのインストール
+### 1. Google Cloud project (your own)
 
-#### 方法A: BRAT 経由（推奨・モバイルでも1タップ更新）
+1. Create a project in the [Google Cloud Console](https://console.cloud.google.com/)
+2. APIs & Services → Library → enable the **Google Drive API**
+3. OAuth consent screen: User type = **External**, add the scope `https://www.googleapis.com/auth/drive`
+4. Move the publishing status to **Production** (in Testing mode refresh tokens expire after 7 days). The "unverified app" warning is expected for a personal project — proceed via *Advanced → Go to…* with your own account
+5. Credentials → Create OAuth client ID → type = **Desktop app**. Copy the client ID and client secret. No redirect URI needs to be registered.
 
-1. Obsidian のコミュニティプラグインから **BRAT** (Beta Reviewers Auto-update Tool) をインストールして有効化
-2. BRAT の設定 →「Add beta plugin」→ `https://github.com/surblue-git/gdsync` を入力
-3. gdsync が自動でインストールされる。以後は BRAT の「Check for updates」（自動チェックも可）で最新リリースに更新できる
+That's the whole external setup — no page to deploy, no server to run.
 
-すでに手動コピーで gdsync を入れている場合も、プラグインID が同じ（`gdsync`）なので同じフォルダに上書きされ、設定（`data.json`）と認証状態はそのまま引き継がれます。
+<details>
+<summary>Alternative: browser sign-in directly on mobile (redirect page)</summary>
 
-#### 方法B: 手動ビルド
+If you cannot sign in on a desktop first (mobile-only setup), create the OAuth client as type **Web application** instead, deploy `redirect-page/index.html` to any static host (GitHub Pages, Cloudflare Pages, …), and register its URL as an authorized redirect URI. The page only forwards the authorization code to `obsidian://gdsync-auth` and handles no secrets (the flow also uses PKCE and a `state` check). Enter the same URL in the plugin's *Redirect URI* setting. If you also want desktop sign-in with a Web application client, additionally register `http://127.0.0.1:42813` as a redirect URI.
+</details>
+
+### 2. Install the plugin
+
+**Community plugins (once accepted):** search for "GDSync" in Obsidian's community plugin browser.
+
+**BRAT (beta):** install the BRAT plugin, then *Add beta plugin* → `https://github.com/surblue-git/gdsync`.
+
+**Manual build:**
 
 ```
 npm install
 npm run build
 ```
 
-生成された `main.js` と `manifest.json` を Vault の `.obsidian/plugins/gdsync/` にコピーし、Obsidian の設定でコミュニティプラグインとして有効化します。
+Copy the generated `main.js`, `manifest.json`, and `styles.css` into `<vault>/.obsidian/plugins/gdsync/` and enable the plugin.
 
-- **Android**: Vault の `.obsidian/plugins/gdsync/` に直接コピー
-- **iOS**: PC で作った Vault ごとコピーするか、ファイルAppで配置
+### 3. Connect
 
-### 4. プラグイン設定
+**On desktop (or whichever device you set up first):**
 
-1. クライアントID / シークレット / リダイレクトURI を入力
-2. 「Google 認証を開始」→ ブラウザで許可 → Obsidian に自動で戻る
-3. 「接続テスト」で確認
-4. 「一覧から選択」で同期対象の Drive フォルダを選択（Drive の URL 貼り付けでも可）
-5. 「フルスキャン実行」→ `GDrive/` 配下にツリーが生成される
+1. Enter the client ID and client secret in the plugin settings
+2. *Authenticate with Google* → approve in the browser → done (the plugin briefly listens on `127.0.0.1:42813` to catch the redirect)
+3. *Test connection* to verify
 
-## 日常の使い方
+**On your phone:**
 
-- ファイルを開く → その場でダウンロードされ表示（2回目以降はキャッシュ、リモート更新があれば再取得）
-- 編集 → 数秒後に自動アップロード
-- リボンの同期アイコン / コマンド「今すぐ同期」→ 保留分の送信 + リモート差分の取得
-- アプリをフォアグラウンドに戻した時にも自動で差分同期
+1. On the connected desktop, settings → *Connection code* → *Copy code*
+2. Send the code to your phone, paste it via *Enter code* in the plugin settings, then delete the message you used to transfer it — the code is equivalent to a password
 
-## 安全設計（重要）
+**Then, on the device that will sync (typically the phone):**
 
-- **空スタブで Drive を上書きしない**多層ガード（未取得ファイルの編集はアップロードされず警告）
-- 削除は常に Drive の**ゴミ箱**へ（完全削除しない）
-- 競合時は両方の版を保持（ローカル版は `名前 (conflict 日時).md`）
-- オフライン編集は保持され、オンライン復帰時に自動送信
+1. *Choose from list* to pick the Drive folder to sync (pasting a Drive URL also works)
+2. *Run full scan* → the stub tree is created under `GDrive/`
 
-## 制限事項
+## Daily use
 
-- Google ドキュメント/スプレッドシート等のネイティブ形式、ショートカットは同期対象外
-- 設定の「最大ファイルサイズ」（既定20MB）を超えるファイルはダウンロードしない
-- Drive 上の同名ファイルは ` (1)` 連番で区別
-- `drive.file` ではなくフル `drive` スコープが必要（Drive for Desktop が作るファイルを読むため）
+- Open a file → it is downloaded on the spot (subsequent opens use the cache; remote updates are re-fetched)
+- Edit → uploaded automatically a few seconds later
+- Ribbon sync icon / *Sync now* command → send pending changes and pull remote changes
+- Returning the app to the foreground also triggers a differential sync
 
-## リリース手順（開発者向け）
+## Safety design
+
+- **Multiple guards against overwriting Drive with empty stubs** (edits to not-yet-downloaded files are never uploaded, with a warning)
+- Deletions always go to the Drive **trash** (nothing is permanently deleted); local deletions follow your Obsidian trash preference
+- On conflict both versions are kept (the local one as `name (conflict <timestamp>).md`)
+- Offline edits are preserved and sent automatically when back online
+
+## Limitations
+
+- Google Docs/Sheets/Slides (native Google formats) and shortcuts are not synced
+- Files above the *Maximum file size* setting (default 20 MB) are not downloaded
+- Files with identical names in the same Drive folder are disambiguated with ` (1)` suffixes
+- Requires the full `drive` scope rather than `drive.file` (see the disclosure section above)
+
+## Releasing (for maintainers)
 
 ```
-npm version patch   # manifest.json / versions.json も自動更新される
+npm version patch   # also updates manifest.json / versions.json
 git push && git push --tags
 ```
 
-タグを push すると GitHub Actions がビルドし、`main.js` と `manifest.json` を添付したリリースを自動作成します。BRAT はこのリリースを見て更新します。
+Pushing a tag triggers GitHub Actions, which builds and attaches `main.js`, `manifest.json`, and `styles.css` to a release.
+
+## License
+
+[MIT](LICENSE)

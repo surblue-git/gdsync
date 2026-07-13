@@ -1,10 +1,10 @@
 <!DOCTYPE html>
-<html lang="ja">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex">
-<title>GDSync 認証</title>
+<title>GDSync authentication</title>
 <style>
   body { font-family: -apple-system, "Segoe UI", sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; background: #f5f5f5; color: #333; }
   .card { background: #fff; border-radius: 12px; padding: 32px; max-width: 420px; text-align: center; box-shadow: 0 2px 12px rgba(0,0,0,.08); }
@@ -15,9 +15,9 @@
 </head>
 <body>
 <div class="card" id="card">
-  <h2>Obsidian に戻っています…</h2>
-  <p id="msg">自動で戻らない場合は下のボタンを押してください。</p>
-  <a class="btn" id="link" href="#">Obsidian に戻る</a>
+  <h2>Returning to Obsidian…</h2>
+  <p id="msg">If you are not redirected automatically, tap the button below.</p>
+  <a class="btn" id="link" href="#">Open Obsidian</a>
 </div>
 <script>
 (function () {
@@ -27,17 +27,17 @@
   var state = q.get("state");
   var card = document.getElementById("card");
   if (error) {
-    card.innerHTML = '<h2 class="err">認証エラー</h2><p><code>' + error.replace(/</g, "&lt;") + '</code></p><p>Obsidian の GDSync 設定からやり直してください。</p>';
+    card.innerHTML = '<h2 class="err">Authentication error</h2><p><code>' + error.replace(/</g, "&lt;") + '</code></p><p>Please start again from the GDSync settings in Obsidian.</p>';
     return;
   }
   if (!code) {
-    card.innerHTML = '<h2 class="err">認可コードがありません</h2><p>Obsidian の GDSync 設定から認証を開始してください。</p>';
+    card.innerHTML = '<h2 class="err">Missing authorization code</h2><p>Please start authentication from the GDSync settings in Obsidian.</p>';
     return;
   }
   var target = "obsidian://gdsync-auth?code=" + encodeURIComponent(code) +
     (state ? "&state=" + encodeURIComponent(state) : "");
   document.getElementById("link").setAttribute("href", target);
-  // コードをURLバー履歴に残さない
+  // Keep the authorization code out of the URL bar history
   try { history.replaceState(null, "", location.pathname); } catch (e) {}
   location.href = target;
 })();

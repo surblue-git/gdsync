@@ -32,7 +32,7 @@ export class FileIndex {
 				}
 			}
 		} catch (e) {
-			console.error("gdsync: index.json の読み込みに失敗。フル再スキャンが必要です。", e);
+			console.error("gdsync: failed to load index.json; a full rescan is required", e);
 			this.data = emptyIndex();
 		}
 		this.rebuildReverseMap();
@@ -72,7 +72,7 @@ export class FileIndex {
 				JSON.stringify(this.data)
 			);
 		} catch (e) {
-			console.error("gdsync: index.json の保存に失敗", e);
+			console.error("gdsync: failed to save index.json", e);
 			this.pendingSave = true;
 		}
 	}

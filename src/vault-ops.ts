@@ -144,10 +144,10 @@ export class VaultOps {
 		return await this.app.vault.createBinary(norm, data);
 	}
 
-	/** ローカル削除（ローカルの .trash へ、イベント抑制付き） */
+	/** ローカル削除（ユーザーのゴミ箱設定に従う、イベント抑制付き） */
 	async deleteLocal(af: TAbstractFile): Promise<void> {
 		this.suppressor.add(af.path);
-		await this.app.vault.trash(af, false);
+		await this.app.fileManager.trashFile(af);
 	}
 
 	/** リモート由来のリネームをローカルへ反映 */

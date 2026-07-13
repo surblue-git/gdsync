@@ -1,0 +1,16 @@
+.gdsync-version {
+	opacity: 0.6;
+	font-size: 0.85em;
+	margin: 0 0 8px;
+}
+
+.gdsync-wide-input {
+	width: 100%;
+}
+
+.gdsync-connection-code {
+	width: 100%;
+	font-family: var(--font-monospace);
+	font-size: 0.8em;
+	resize: vertical;
+}

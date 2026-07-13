@@ -1,12 +1,34 @@
-import { Notice, requestUrl } from "obsidian";
+import { Notice, Platform, requestUrl } from "obsidian";
+import type { Server } from "http";
 import type GdsyncPlugin from "./main";
 
 const AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token";
 const SCOPE = "https://www.googleapis.com/auth/drive";
+/** 認可開始からコールバック受理までの有効期限 */
+const PENDING_AUTH_TTL_MS = 10 * 60 * 1000;
+/**
+ * デスクトップのループバック認証で使う固定ポート。
+ * 固定にしておくことで、Web アプリケーション型クライアントでも
+ * `http://127.0.0.1:42813` を事前登録すれば動く（Desktop 型なら登録不要）。
+ */
+const LOOPBACK_PORT = 42813;
+const LOOPBACK_REDIRECT_URI = `http://127.0.0.1:${LOOPBACK_PORT}`;
 
 /** 認証切れ・未認証。ユーザー操作（再認証）が必要な状態 */
 export class AuthError extends Error {}
+
+/** 端末間で認証を移すための接続コードのペイロード */
+interface ConnectionPayload {
+	v: 1;
+	clientId: string;
+	clientSecret: string;
+	tokens: {
+		accessToken: string;
+		refreshToken: string;
+		expiresAt: number;
+	};
+}
 
 function base64UrlEncode(buffer: ArrayBuffer): string {
 	const bytes = new Uint8Array(buffer);
@@ -23,6 +45,8 @@ function randomToken(byteLength: number): string {
 
 export class AuthManager {
 	private refreshing: Promise<void> | null = null;
+	private loopbackServer: Server | null = null;
+	private loopbackTimer: number | null = null;
 
 	constructor(private plugin: GdsyncPlugin) {}
 
@@ -30,60 +54,195 @@ export class AuthManager {
 		return !!this.plugin.settings.tokens?.refreshToken;
 	}
 
-	/** 認可URLを生成して外部ブラウザを開く。verifier/state は往復中の kill に備え data.json に保存 */
+	/** unload 時のクリーンアップ */
+	dispose(): void {
+		this.stopLoopback();
+	}
+
+	/**
+	 * 認証を開始する。
+	 * デスクトップ: 一時ローカルサーバー（ループバック）で完結。リダイレクトページ不要。
+	 * モバイル: リダイレクトURI設定があれば外部ブラウザ経由、なければ接続コードを案内。
+	 */
 	async beginAuth(): Promise<void> {
 		const s = this.plugin.settings;
-		if (!s.clientId || !s.clientSecret || !s.redirectUri) {
-			new Notice("GDSync: クライアントID・シークレット・リダイレクトURIを先に設定してください。");
+		if (!s.clientId || !s.clientSecret) {
+			new Notice("GDSync: Set the client ID and client secret first.");
 			return;
 		}
-		const codeVerifier = randomToken(64);
+		if (Platform.isDesktopApp) {
+			await this.beginLoopbackAuth();
+			return;
+		}
+		if (!s.redirectUri) {
+			new Notice(
+				"GDSync: On mobile, either paste a connection code created on desktop (settings → Connection code), or set a redirect URI for browser sign-in.",
+				12000
+			);
+			return;
+		}
+		await this.beginRedirectAuth();
+	}
+
+	private async createPkce(): Promise<{ verifier: string; challenge: string }> {
+		const verifier = randomToken(64);
 		const digest = await crypto.subtle.digest(
 			"SHA-256",
-			new TextEncoder().encode(codeVerifier)
+			new TextEncoder().encode(verifier)
 		);
-		const state = randomToken(16);
-		s.pendingAuth = { state, codeVerifier, createdAt: Date.now() };
-		await this.plugin.saveSettings();
+		return { verifier, challenge: base64UrlEncode(digest) };
+	}
 
+	private buildAuthUrl(redirectUri: string, state: string, challenge: string): string {
 		const params = new URLSearchParams({
-			client_id: s.clientId,
-			redirect_uri: s.redirectUri,
+			client_id: this.plugin.settings.clientId,
+			redirect_uri: redirectUri,
 			response_type: "code",
 			scope: SCOPE,
 			access_type: "offline",
 			prompt: "consent",
 			state,
-			code_challenge: base64UrlEncode(digest),
+			code_challenge: challenge,
 			code_challenge_method: "S256",
 		});
-		window.open(`${AUTH_ENDPOINT}?${params.toString()}`);
+		return `${AUTH_ENDPOINT}?${params.toString()}`;
+	}
+
+	// ---------------- デスクトップ: ループバックフロー ----------------
+
+	/**
+	 * 127.0.0.1 の一時 HTTP サーバーで認可コードを受ける。
+	 * リダイレクトページのホスティングが不要になる。デスクトップ専用。
+	 */
+	private async beginLoopbackAuth(): Promise<void> {
+		this.stopLoopback();
+		const { verifier, challenge } = await this.createPkce();
+		const state = randomToken(16);
+
+		// eslint-disable-next-line @typescript-eslint/no-var-requires
+		const { createServer } = require("http") as typeof import("http");
+		const server = createServer((req, res) => {
+			let code: string | null = null;
+			let st: string | null = null;
+			let error: string | null = null;
+			try {
+				const url = new URL(req.url ?? "/", LOOPBACK_REDIRECT_URI);
+				code = url.searchParams.get("code");
+				st = url.searchParams.get("state");
+				error = url.searchParams.get("error");
+			} catch (e) {
+				/* 不正なURLは無視 */
+			}
+			if (!code && !error) {
+				// ブラウザの favicon リクエスト等
+				res.writeHead(404);
+				res.end();
+				return;
+			}
+			res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+			res.end(
+				"<!DOCTYPE html><html><body style=\"font-family:sans-serif;text-align:center;padding-top:15vh\">" +
+					"<h2>GDSync</h2><p>You can close this tab and return to Obsidian.</p></body></html>"
+			);
+			this.stopLoopback();
+			if (error) {
+				new Notice(`GDSync: Authentication was cancelled or failed (${error}).`);
+				return;
+			}
+			if (st !== state) {
+				new Notice("GDSync: Authentication state mismatch. Please start authentication again.");
+				return;
+			}
+			void this.exchangeCode(code!, verifier, LOOPBACK_REDIRECT_URI);
+		});
+
+		try {
+			await new Promise<void>((resolve, reject) => {
+				server.once("error", reject);
+				server.listen(LOOPBACK_PORT, "127.0.0.1", () => resolve());
+			});
+		} catch (e) {
+			new Notice(
+				`GDSync: Could not open local port ${LOOPBACK_PORT} for sign-in (is another app using it?). ` +
+					`Close the conflicting app, or use the redirect-page sign-in instead.`,
+				12000
+			);
+			return;
+		}
+		this.loopbackServer = server;
+		// 放置されたら自動で閉じる
+		this.loopbackTimer = window.setTimeout(() => this.stopLoopback(), PENDING_AUTH_TTL_MS);
+		window.open(this.buildAuthUrl(LOOPBACK_REDIRECT_URI, state, challenge));
+	}
+
+	private stopLoopback(): void {
+		if (this.loopbackTimer !== null) {
+			window.clearTimeout(this.loopbackTimer);
+			this.loopbackTimer = null;
+		}
+		if (this.loopbackServer) {
+			try {
+				this.loopbackServer.close();
+			} catch (e) {
+				/* 既に閉じている */
+			}
+			this.loopbackServer = null;
+		}
+	}
+
+	// ---------------- モバイル: リダイレクトページ経由フロー ----------------
+
+	/** 認可URLを生成して外部ブラウザを開く。verifier/state は往復中の kill に備え data.json に保存 */
+	private async beginRedirectAuth(): Promise<void> {
+		const s = this.plugin.settings;
+		const { verifier, challenge } = await this.createPkce();
+		const state = randomToken(16);
+		s.pendingAuth = { state, codeVerifier: verifier, createdAt: Date.now() };
+		await this.plugin.saveSettings();
+		window.open(this.buildAuthUrl(s.redirectUri, state, challenge));
 	}
 
 	/** obsidian://gdsync-auth コールバックの処理 */
 	async handleCallback(params: Record<string, string>): Promise<void> {
 		const s = this.plugin.settings;
 		if (params.error) {
-			new Notice(`GDSync: 認証がキャンセル/失敗しました (${params.error})`);
+			new Notice(`GDSync: Authentication was cancelled or failed (${params.error}).`);
 			return;
 		}
 		const pending = s.pendingAuth;
 		if (!pending || !params.state || params.state !== pending.state) {
-			new Notice("GDSync: 認証状態が一致しません。もう一度認証を開始してください。");
+			new Notice("GDSync: Authentication state mismatch. Please start authentication again.");
+			return;
+		}
+		if (Date.now() - pending.createdAt > PENDING_AUTH_TTL_MS) {
+			s.pendingAuth = null;
+			await this.plugin.saveSettings();
+			new Notice("GDSync: The authentication request has expired. Please start again.");
 			return;
 		}
 		if (!params.code) {
-			new Notice("GDSync: 認可コードがありません。");
+			new Notice("GDSync: Missing authorization code.");
 			return;
 		}
+		await this.exchangeCode(params.code, pending.codeVerifier, s.redirectUri);
+	}
+
+	// ---------------- 共通: コード→トークン交換 ----------------
+
+	private async exchangeCode(
+		code: string,
+		codeVerifier: string,
+		redirectUri: string
+	): Promise<void> {
+		const s = this.plugin.settings;
 		try {
 			const body = new URLSearchParams({
-				code: params.code,
+				code,
 				client_id: s.clientId,
 				client_secret: s.clientSecret,
-				redirect_uri: s.redirectUri,
+				redirect_uri: redirectUri,
 				grant_type: "authorization_code",
-				code_verifier: pending.codeVerifier,
+				code_verifier: codeVerifier,
 			});
 			const res = await requestUrl({
 				url: TOKEN_ENDPOINT,
@@ -98,7 +257,7 @@ export class AuthManager {
 			}
 			const data = res.json;
 			if (!data.refresh_token) {
-				throw new Error("refresh_token が返されませんでした。GCP側で prompt=consent が効いているか確認してください。");
+				throw new Error("No refresh_token was returned. Check that prompt=consent is effective on the Google Cloud side.");
 			}
 			s.tokens = {
 				accessToken: data.access_token,
@@ -107,25 +266,80 @@ export class AuthManager {
 			};
 			s.pendingAuth = null;
 			await this.plugin.saveSettings();
-			new Notice("GDSync: Google 認証に成功しました。");
+			new Notice("GDSync: Google authentication succeeded.");
 			this.plugin.onAuthenticated();
 		} catch (e) {
-			console.error("gdsync auth callback failed", e);
-			new Notice(`GDSync: トークン交換に失敗しました。${e instanceof Error ? e.message : ""}`);
+			console.error("gdsync auth code exchange failed", e);
+			new Notice(`GDSync: Token exchange failed. ${e instanceof Error ? e.message : ""}`);
 		}
+	}
+
+	// ---------------- 接続コード（端末間の認証移行） ----------------
+
+	/**
+	 * 認証済みのクレデンシャル+トークンを1つの文字列にまとめる。
+	 * モバイルに貼り付ければブラウザ往復なしで接続できる。
+	 * リフレッシュトークンを含むため、パスワードと同等に扱うこと。
+	 */
+	exportConnectionCode(): string | null {
+		const s = this.plugin.settings;
+		if (!s.clientId || !s.clientSecret || !s.tokens) return null;
+		const payload: ConnectionPayload = {
+			v: 1,
+			clientId: s.clientId,
+			clientSecret: s.clientSecret,
+			tokens: { ...s.tokens },
+		};
+		const json = JSON.stringify(payload);
+		return btoa(unescape(encodeURIComponent(json)));
+	}
+
+	/** 接続コードを取り込んで認証状態を復元する */
+	async importConnectionCode(codeText: string): Promise<boolean> {
+		let payload: ConnectionPayload;
+		try {
+			const json = decodeURIComponent(escape(atob(codeText.trim())));
+			payload = JSON.parse(json) as ConnectionPayload;
+		} catch (e) {
+			new Notice("GDSync: Invalid connection code.");
+			return false;
+		}
+		if (
+			payload.v !== 1 ||
+			!payload.clientId ||
+			!payload.clientSecret ||
+			!payload.tokens?.refreshToken
+		) {
+			new Notice("GDSync: Invalid connection code.");
+			return false;
+		}
+		const s = this.plugin.settings;
+		s.clientId = payload.clientId;
+		s.clientSecret = payload.clientSecret;
+		s.tokens = {
+			accessToken: payload.tokens.accessToken,
+			refreshToken: payload.tokens.refreshToken,
+			// アクセストークンの鮮度は不明として即リフレッシュさせる
+			expiresAt: 0,
+		};
+		s.pendingAuth = null;
+		await this.plugin.saveSettings();
+		new Notice("GDSync: Connected with the connection code.");
+		this.plugin.onAuthenticated();
+		return true;
 	}
 
 	/** 有効なアクセストークンを返す。期限切れなら先にリフレッシュ */
 	async getAccessToken(): Promise<string> {
 		const t = this.plugin.settings.tokens;
 		if (!t?.refreshToken) {
-			throw new AuthError("Google 未認証です。GDSync 設定から認証してください。");
+			throw new AuthError("Not authenticated with Google. Authenticate from the GDSync settings.");
 		}
 		if (Date.now() >= t.expiresAt) {
 			await this.refresh();
 		}
 		const cur = this.plugin.settings.tokens;
-		if (!cur) throw new AuthError("再認証が必要です。");
+		if (!cur) throw new AuthError("Re-authentication required.");
 		return cur.accessToken;
 	}
 
@@ -153,7 +367,7 @@ export class AuthManager {
 	private async doRefresh(): Promise<void> {
 		const s = this.plugin.settings;
 		const t = s.tokens;
-		if (!t?.refreshToken) throw new AuthError("再認証が必要です。");
+		if (!t?.refreshToken) throw new AuthError("Re-authentication required.");
 		const body = new URLSearchParams({
 			client_id: s.clientId,
 			client_secret: s.clientSecret,
@@ -171,7 +385,7 @@ export class AuthManager {
 			});
 		} catch (e) {
 			// ネットワーク断はトークンを破棄しない
-			throw new Error("GDSync: トークン更新に失敗しました（オフライン？）");
+			throw new Error("GDSync: Token refresh failed (offline?).");
 		}
 		if (res.status >= 400) {
 			const err = res.json?.error;
@@ -179,9 +393,9 @@ export class AuthManager {
 				// リフレッシュトークン失効 → 再認証が必要
 				s.tokens = null;
 				await this.plugin.saveSettings();
-				throw new AuthError("Google の認証が失効しました。設定から再認証してください。");
+				throw new AuthError("Google authentication has expired. Re-authenticate from the settings.");
 			}
-			throw new Error(`GDSync: トークン更新エラー ${res.status}: ${res.json?.error_description || ""}`);
+			throw new Error(`GDSync: Token refresh error ${res.status}: ${res.json?.error_description || ""}`);
 		}
 		const data = res.json;
 		s.tokens = {
