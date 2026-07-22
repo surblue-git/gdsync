@@ -14,3 +14,8 @@
 	font-size: 0.8em;
 	resize: vertical;
 }
+
+/* 選択中フォルダのフルパス/IDが長くても折り返して全体を表示する */
+.gdsync-folder-desc {
+	overflow-wrap: anywhere;
+}

@@ -6,6 +6,7 @@ import {
 	PluginSettingTab,
 	Setting,
 } from "obsidian";
+import { FOLDER_MIME } from "./drive-client";
 import { t } from "./i18n";
 import type GdsyncPlugin from "./main";
 import { DriveItemMeta } from "./types";
@@ -208,7 +209,7 @@ export class GdsyncSettingTab extends PluginSettingTab {
 		// ---------- 同期対象 ----------
 		new Setting(containerEl).setName(t.headingSyncTarget).setHeading();
 
-		new Setting(containerEl)
+		const folderSetting = new Setting(containerEl)
 			.setName(t.driveFolder)
 			.setDesc(
 				s.rootFolderName
@@ -223,6 +224,31 @@ export class GdsyncSettingTab extends PluginSettingTab {
 						s.rootFolderName = "";
 						await this.plugin.saveSettings();
 					});
+				// フォーカスが外れたら、手入力IDの実在を検証してフォルダ名を解決する。
+				// 無効なID（余分な文字の混入など）を黙って受け入れず、その場で気付けるように。
+				text.inputEl.addEventListener("blur", async () => {
+					const id = s.rootFolderId;
+					if (!id || s.rootFolderName) return;
+					try {
+						const meta = await this.plugin.drive.getMeta(
+							id,
+							"id,name,mimeType,trashed"
+						);
+						if (meta.trashed || meta.mimeType !== FOLDER_MIME) {
+							new Notice(t.rootNotFolder(id), 12000);
+							return;
+						}
+						s.rootFolderName = meta.name;
+						await this.plugin.saveSettings();
+						this.display();
+					} catch (e) {
+						new Notice(
+							t.rootResolveFailed(e instanceof Error ? e.message : String(e)),
+							12000
+						);
+					}
+				});
+				text.inputEl.addClass("gdsync-wide-input");
 			})
 			.addButton((btn) =>
 				btn.setButtonText(t.btnChooseFromList).onClick(async () => {
@@ -243,6 +269,9 @@ export class GdsyncSettingTab extends PluginSettingTab {
 					}
 				})
 			);
+
+		// 選択中フォルダのフルパス/IDは長いので、狭い画面でも折り返して全体が見えるように
+		folderSetting.descEl.addClass("gdsync-folder-desc");
 
 		new Setting(containerEl)
 			.setName(t.mirrorBase)

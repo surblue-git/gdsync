@@ -82,6 +82,12 @@ const en = {
 
 	// ---- sync-engine ----
 	noFolderSelected: "GDSync: No Google Drive folder has been selected.",
+	rootNotFound: (id: string) =>
+		`GDSync: The Drive folder ID "${id}" does not exist. Check the ID (a stray character can break it) and re-select the folder.`,
+	rootNotFolder: (id: string) =>
+		`GDSync: "${id}" is not a valid Drive folder (it may be a file or trashed). Re-select the folder.`,
+	rootResolveFailed: (detail: string) =>
+		`GDSync: Could not verify the Drive folder. ${detail}`,
 	scanAlreadyRunning: "GDSync: A scan is already running.",
 	listingDriveFiles: "Listing Drive files…",
 	listingDriveFilesCount: (n: number) => `Listing Drive files… ${n}`,
@@ -254,6 +260,12 @@ const ja: Strings = {
 
 	// ---- sync-engine ----
 	noFolderSelected: "GDSync: 同期対象の Google Drive フォルダが未選択です。",
+	rootNotFound: (id: string) =>
+		`GDSync: Drive フォルダID「${id}」が存在しません。IDに余分な文字が混入していないか確認し、フォルダを選び直してください。`,
+	rootNotFolder: (id: string) =>
+		`GDSync:「${id}」は有効な Drive フォルダではありません（ファイル、またはゴミ箱内の可能性）。フォルダを選び直してください。`,
+	rootResolveFailed: (detail: string) =>
+		`GDSync: Drive フォルダを確認できませんでした。${detail}`,
 	scanAlreadyRunning: "GDSync: スキャンは既に実行中です。",
 	listingDriveFiles: "Drive の一覧を取得中…",
 	listingDriveFilesCount: (n: number) => `Drive の一覧を取得中… ${n}`,

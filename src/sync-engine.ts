@@ -172,6 +172,28 @@ export class SyncEngine {
 		}
 		this.scanning = true;
 		try {
+			// ルートフォルダの実在＆種別を検証。無効なIDだと BFS が空振りして
+			// 「既存は見えるが新規だけ永遠に同期されない」紛らわしい失敗になるため、
+			// リスト取得の前に弾いて明確に通知する。
+			try {
+				const rootMeta = await this.drive.getMeta(
+					s.rootFolderId,
+					"id,mimeType,trashed"
+				);
+				if (rootMeta.trashed || rootMeta.mimeType !== FOLDER_MIME) {
+					new Notice(t.rootNotFolder(s.rootFolderId), 15000);
+					return;
+				}
+			} catch (e) {
+				if (e instanceof ApiError && e.status === 404) {
+					new Notice(t.rootNotFound(s.rootFolderId), 15000);
+				} else if (e instanceof NetworkError) {
+					new Notice(`GDSync: ${t.possiblyOffline}`, 12000);
+				} else {
+					this.notifyError(t.scanFailed, e);
+				}
+				return;
+			}
 			this.status.progress(t.listingDriveFiles);
 			// リスト取得前にトークンを確保 → スキャン中の変更を取りこぼさない
 			const startToken = await this.drive.getStartPageToken();
