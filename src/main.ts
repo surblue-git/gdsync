@@ -137,6 +137,17 @@ export default class GdsyncPlugin extends Plugin {
 				}
 			})
 		);
+		// ノート本文が（ハイドレートや編集で）解析されたら、開いているノートの
+		// 埋め込み添付をハイドレートする。file-open 時点ではまだスタブで埋め込みが
+		// 見えないケースをここで拾う。
+		this.registerEvent(
+			this.app.metadataCache.on("changed", (file) => {
+				if (!(file instanceof TFile) || !this.isActive()) return;
+				const rel = this.engine.toRel(file.path);
+				if (rel === null || rel === "") return;
+				if (this.engine.isFileOpenPublic(rel)) void this.engine.hydrateEmbedsOf(file);
+			})
+		);
 
 		// アプリ復帰時に差分同期（モバイルでの主要トリガー）
 		this.registerDomEvent(document, "visibilitychange", () => {

@@ -140,10 +140,10 @@ export class SyncEngine {
 	}
 
 	/**
-	 * eager 指定に一致し、まだ実体を持たない1ファイルを即時ハイドレートする。
+	 * まだ実体を持たない1ファイル（スタブ）を即時ハイドレートする。
 	 * 呼び出し側で当該 rel のロックを取得していないこと（内部で withLock を取る）。
 	 */
-	private async hydrateEagerRel(rel: string): Promise<void> {
+	private async hydrateStubRel(rel: string): Promise<void> {
 		const file = this.ops.getFile(this.toVault(rel));
 		if (!file) return;
 		await this.withLock(rel, async () => {
@@ -158,7 +158,38 @@ export class SyncEngine {
 	async hydrateEagerFiles(): Promise<void> {
 		if (!this.plugin.settings.eagerSyncPatterns.trim()) return;
 		for (const rel of Object.keys(this.index.data.files)) {
-			if (this.isEager(rel)) await this.hydrateEagerRel(rel);
+			if (this.isEager(rel)) await this.hydrateStubRel(rel);
+		}
+	}
+
+	/**
+	 * 開いたノートが埋め込む/リンクする添付（画像等）をハイドレートする。
+	 * 埋め込み画像は Obsidian のレンダラが直接読むだけで file-open が発火しないため、
+	 * スタブのままだと表示されない。ノートを開いた時にその添付だけを取得する
+	 * （オンデマンドの利点を保ったまま、見ているノートの画像は自動で揃う）。
+	 */
+	async hydrateEmbedsOf(file: TFile): Promise<void> {
+		if (file.extension !== "md") return;
+		const cache = this.plugin.app.metadataCache.getFileCache(file);
+		if (!cache) return;
+		const refs = [...(cache.embeds ?? []), ...(cache.links ?? [])];
+		if (refs.length === 0) return;
+		const seen = new Set<string>();
+		for (const ref of refs) {
+			const dest = this.plugin.app.metadataCache.getFirstLinkpathDest(
+				ref.link,
+				file.path
+			);
+			if (!dest || dest.path === file.path) continue;
+			const rel = this.toRel(dest.path);
+			if (rel === null || rel === "" || this.isExcluded(rel)) continue;
+			if (seen.has(rel)) continue;
+			seen.add(rel);
+			const entry = this.index.getFile(rel);
+			if (!entry || !entry.fileId || entry.hydrated || entry.dirty || entry.tooLarge) {
+				continue;
+			}
+			await this.hydrateStubRel(rel);
 		}
 	}
 
@@ -185,6 +216,11 @@ export class SyncEngine {
 			}
 		});
 		return open;
+	}
+
+	/** rel のファイルがいずれかのリーフで開かれているか（外部イベントからの利用可）。 */
+	isFileOpenPublic(rel: string): boolean {
+		return this.isFileOpen(rel);
 	}
 
 	// ---------------- 初回/フルスキャン ----------------
@@ -441,6 +477,10 @@ export class SyncEngine {
 		entry.lastAccess = Date.now();
 		this.index.markDirty();
 		if (!entry.fileId) return; // ローカル新規（リモート未作成）
+		// 開いたノートの埋め込み添付（画像等）も取得する。ノート本文がまだ
+		// スタブなら metadataCache に埋め込みが無いので、ダウンロード後に
+		// 発火する metadataCache "changed" 側でも拾う（main.ts で登録）。
+		if (file.extension === "md") void this.hydrateEmbedsOf(file);
 		await this.withLock(rel, async () => {
 			if (entry.tooLarge) {
 				new Notice(t.tooLargeOnOpen(file.name, this.plugin.settings.maxFileSizeMB));
@@ -1050,7 +1090,7 @@ export class SyncEngine {
 					num(meta.size) > this.plugin.settings.maxFileSizeMB * 1024 * 1024,
 			});
 			// eager 指定なら新規スタブをその場で実体化
-			if (this.isEager(rel)) await this.hydrateEagerRel(rel);
+			if (this.isEager(rel)) await this.hydrateStubRel(rel);
 		}
 	}
 
