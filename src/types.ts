@@ -30,6 +30,12 @@ export interface GdsyncSettings {
 	cacheMaxCount: number;
 	/** 除外パターン（1行1パターン、パスの部分一致） */
 	excludePatterns: string;
+	/**
+	 * 常時フル同期パターン（1行1パターン、パスの部分一致）。
+	 * 一致するファイルはスタブで放置せず、スキャン/変更検出時に即座に実体化する。
+	 * 他プラグインの設定ファイル等、file-open を経ずにプログラムから読むファイル向け。
+	 */
+	eagerSyncPatterns: string;
 	/** デスクトップでも同期機能を有効にする（既定はモバイルのみ） */
 	enableOnDesktop: boolean;
 	uploadDebounceSec: number;
@@ -50,6 +56,7 @@ export const DEFAULT_SETTINGS: GdsyncSettings = {
 	cacheMaxAgeDays: 14,
 	cacheMaxCount: 200,
 	excludePatterns: ".obsidian\n.trash",
+	eagerSyncPatterns: "",
 	enableOnDesktop: false,
 	uploadDebounceSec: 4,
 	freshnessTtlMin: 5,

@@ -149,6 +149,8 @@ export default class GdsyncPlugin extends Plugin {
 			// ミラー生成でフォルダが作られる前に置く（MediaStore が索引する前に除外させる）
 			await this.ensureNoMedia();
 			await this.engine.syncNow();
+			// eager 指定ファイルは起動時に実体を揃える（他プラグインが読む前に）
+			await this.engine.hydrateEagerFiles();
 			await this.engine.evictCache();
 		}
 	}

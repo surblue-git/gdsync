@@ -175,6 +175,9 @@ const en = {
 	excludePatterns: "Exclude patterns",
 	excludePatternsDesc:
 		"One pattern per line. Paths containing a pattern are not synced.",
+	eagerSyncPatterns: "Always-hydrate patterns",
+	eagerSyncPatternsDesc:
+		"One pattern per line. Matching files are kept fully downloaded (never stubs), so plugins can read them without opening the file. Use for small config/state files, not large content.",
 	buildIndex: "Build or update index (full scan)",
 	buildIndexDesc:
 		"Lists your Drive files and creates the folder structure and stub files.",
@@ -353,6 +356,9 @@ const ja: Strings = {
 	excludePatterns: "除外パターン",
 	excludePatternsDesc:
 		"1行に1パターン。パターンを含むパスは同期されません。",
+	eagerSyncPatterns: "常時フル同期パターン",
+	eagerSyncPatternsDesc:
+		"1行に1パターン。一致するファイルは常に実体をダウンロードした状態（スタブにしない）に保つため、他プラグインがファイルを開かずに読み込めます。大きな本文ではなく小さな設定・状態ファイル向けです。",
 	buildIndex: "インデックス構築・更新（フルスキャン）",
 	buildIndexDesc:
 		"Drive のファイルを一覧し、フォルダ構造とスタブファイルを作成します。",

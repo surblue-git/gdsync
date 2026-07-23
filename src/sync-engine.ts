@@ -129,6 +129,39 @@ export class SyncEngine {
 		return false;
 	}
 
+	/** 常時フル同期パターンに一致するか（スタブにせず実体を保つ対象） */
+	private isEager(rel: string): boolean {
+		const patterns = this.plugin.settings.eagerSyncPatterns
+			.split("\n")
+			.map((p) => p.trim())
+			.filter((p) => p.length > 0);
+		if (patterns.length === 0) return false;
+		return patterns.some((p) => rel === p || rel.includes(p));
+	}
+
+	/**
+	 * eager 指定に一致し、まだ実体を持たない1ファイルを即時ハイドレートする。
+	 * 呼び出し側で当該 rel のロックを取得していないこと（内部で withLock を取る）。
+	 */
+	private async hydrateEagerRel(rel: string): Promise<void> {
+		const file = this.ops.getFile(this.toVault(rel));
+		if (!file) return;
+		await this.withLock(rel, async () => {
+			// 別経路で状態が変わっている場合に備えロック取得後に再判定
+			const e = this.index.getFile(rel);
+			if (!e || !e.fileId || e.hydrated || e.dirty || e.tooLarge) return;
+			await this.downloadInto(file, e);
+		});
+	}
+
+	/** eager 指定に一致するスタブを一括で実体化する（フルスキャン後・起動時・設定変更時） */
+	async hydrateEagerFiles(): Promise<void> {
+		if (!this.plugin.settings.eagerSyncPatterns.trim()) return;
+		for (const rel of Object.keys(this.index.data.files)) {
+			if (this.isEager(rel)) await this.hydrateEagerRel(rel);
+		}
+	}
+
 	/** per-file 直列化。ハイドレートとアップロードの競走を防ぐ */
 	private withLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
 		const prev = this.locks.get(key) || Promise.resolve();
@@ -372,6 +405,9 @@ export class SyncEngine {
 				}
 				this.index.deleteFolder(rel);
 			}
+
+			// eager 指定ファイルはスタブのままにせず実体化しておく
+			await this.hydrateEagerFiles();
 
 			this.index.data.rootFolderId = s.rootFolderId;
 			this.index.data.changesPageToken = startToken;
@@ -984,8 +1020,8 @@ export class SyncEngine {
 				await this.withLock(rel, async () => {
 					const f = this.ops.getFile(this.toVault(rel));
 					if (!f) return;
-					if (this.isFileOpen(rel)) {
-						// 開いているファイルは即時更新
+					if (this.isFileOpen(rel) || this.isEager(rel)) {
+						// 開いているファイル・eager 指定は即時更新して実体を保つ
 						await this.downloadInto(f, entry);
 					} else {
 						// 未オープンはスタブ化（次回オープン時に取得）
@@ -1013,6 +1049,8 @@ export class SyncEngine {
 				tooLarge:
 					num(meta.size) > this.plugin.settings.maxFileSizeMB * 1024 * 1024,
 			});
+			// eager 指定なら新規スタブをその場で実体化
+			if (this.isEager(rel)) await this.hydrateEagerRel(rel);
 		}
 	}
 
@@ -1098,6 +1136,7 @@ export class SyncEngine {
 			// アップロード済みでリモートと一致しているものだけ安全に破棄できる
 			if ((entry.hydratedMd5 ?? null) !== (entry.remoteMd5 ?? null)) continue;
 			if (this.isFileOpen(rel)) continue;
+			if (this.isEager(rel)) continue; // eager 指定は常に実体を保つ
 			candidates.push({ rel, entry });
 		}
 		const maxAgeMs = s.cacheMaxAgeDays * 24 * 60 * 60 * 1000;

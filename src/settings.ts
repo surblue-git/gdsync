@@ -295,6 +295,19 @@ export class GdsyncSettingTab extends PluginSettingTab {
 			});
 
 		new Setting(containerEl)
+			.setName(t.eagerSyncPatterns)
+			.setDesc(t.eagerSyncPatternsDesc)
+			.addTextArea((ta) => {
+				ta.setValue(s.eagerSyncPatterns).onChange(async (v) => {
+					s.eagerSyncPatterns = v;
+					await this.plugin.saveSettings();
+					// 追加された指定を既存スタブに即反映する
+					void this.plugin.engine.hydrateEagerFiles();
+				});
+				ta.inputEl.rows = 3;
+			});
+
+		new Setting(containerEl)
 			.setName(t.buildIndex)
 			.setDesc(t.buildIndexDesc)
 			.addButton((btn) =>
