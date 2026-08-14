@@ -192,6 +192,12 @@ export default class GdsyncPlugin extends Plugin {
 	onAuthenticated(): void {
 		if (!this.settings.rootFolderId) {
 			new Notice(t.chooseFolderNext);
+			return;
+		}
+		// 接続コードで同期対象ごと引き継いだ直後は、フォルダ選択ではなく
+		// フルスキャンが次の一手になる（既にミラー済みの端末には出さない）
+		if (Object.keys(this.index.data.files).length === 0) {
+			new Notice(t.runFullScanNext, 10000);
 		}
 	}
 

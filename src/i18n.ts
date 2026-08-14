@@ -56,6 +56,8 @@ const en = {
 	tokenExchangeFailed: (msg: string) => `GDSync: Token exchange failed. ${msg}`,
 	invalidConnectionCode: "GDSync: Invalid connection code.",
 	connectedWithCode: "GDSync: Connected with the connection code.",
+	connectedWithCodeSettings: (n: number) =>
+		`GDSync: Connected with the connection code (${n} shared settings imported).`,
 	notAuthenticated:
 		"Not authenticated with Google. Authenticate from the GDSync settings.",
 	reauthRequired: "Re-authentication required.",
@@ -79,6 +81,8 @@ const en = {
 	ribbonSyncNow: "GDSync: Sync now",
 	chooseFolderNext:
 		"GDSync: Next, choose the Google Drive folder to sync in the settings tab.",
+	runFullScanNext:
+		"GDSync: The sync target was carried over. Run a full scan to build the mirror.",
 
 	// ---- sync-engine ----
 	noFolderSelected: "GDSync: No Google Drive folder has been selected.",
@@ -154,7 +158,7 @@ const en = {
 	btnLogout: "Log out",
 	connCode: "Connection code",
 	connCodeDesc:
-		"Moves this authentication to another device (e.g. sign in on desktop, then paste the code on your phone). The code contains your credentials and tokens — treat it like a password and delete it after use.",
+		"Moves this authentication and the shared settings (Drive folder, mirror base folder, exclude / always-sync patterns, file size, debounce, freshness) to another device — e.g. sign in on desktop, then paste the code on your phone. Device-specific settings (cache limits, desktop toggle) are not carried over. The code contains your credentials and tokens — treat it like a password and delete it after use.",
 	btnCopyCode: "Copy code",
 	authFirst: "GDSync: Authenticate first.",
 	codeCopied: "GDSync: Connection code copied. Treat it like a password.",
@@ -237,6 +241,8 @@ const ja: Strings = {
 	tokenExchangeFailed: (msg: string) => `GDSync: トークン交換に失敗しました。${msg}`,
 	invalidConnectionCode: "GDSync: 接続コードが無効です。",
 	connectedWithCode: "GDSync: 接続コードで接続しました。",
+	connectedWithCodeSettings: (n: number) =>
+		`GDSync: 接続コードで接続しました（共有設定 ${n} 件を取り込み）。`,
 	notAuthenticated:
 		"Google に未認証です。GDSync の設定から認証してください。",
 	reauthRequired: "再認証が必要です。",
@@ -260,6 +266,8 @@ const ja: Strings = {
 	ribbonSyncNow: "GDSync: 今すぐ同期",
 	chooseFolderNext:
 		"GDSync: 次に、設定タブで同期対象の Google Drive フォルダを選択してください。",
+	runFullScanNext:
+		"GDSync: 同期対象の設定を引き継ぎました。フルスキャンを実行してミラーを作成してください。",
 
 	// ---- sync-engine ----
 	noFolderSelected: "GDSync: 同期対象の Google Drive フォルダが未選択です。",
@@ -335,7 +343,7 @@ const ja: Strings = {
 	btnLogout: "ログアウト",
 	connCode: "接続コード",
 	connCodeDesc:
-		"この認証を別の端末へ移します（例: デスクトップで認証し、コードをスマホに貼り付け）。コードは認証情報とトークンを含みます — パスワードと同等に扱い、使用後は削除してください。",
+		"この認証と共有設定（Drive フォルダ・ミラー先ベースフォルダ・除外/常時フル同期パターン・最大サイズ・アップロード待ち時間・鮮度確認間隔）を別の端末へ移します（例: デスクトップで認証し、コードをスマホに貼り付け）。端末固有の設定（キャッシュ上限・デスクトップ有効化）は引き継ぎません。コードは認証情報とトークンを含みます — パスワードと同等に扱い、使用後は削除してください。",
 	btnCopyCode: "コードをコピー",
 	authFirst: "GDSync: 先に認証してください。",
 	codeCopied: "GDSync: 接続コードをコピーしました。パスワードと同等に扱ってください。",

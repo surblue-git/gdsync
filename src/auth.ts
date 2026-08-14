@@ -2,6 +2,7 @@ import { Notice, Platform, requestUrl } from "obsidian";
 import type { Server } from "http";
 import { t } from "./i18n";
 import type GdsyncPlugin from "./main";
+import { applySharedSettings, pickSharedSettings, SharedSettings } from "./types";
 
 const AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token";
@@ -19,9 +20,13 @@ const LOOPBACK_REDIRECT_URI = `http://127.0.0.1:${LOOPBACK_PORT}`;
 /** 認証切れ・未認証。ユーザー操作（再認証）が必要な状態 */
 export class AuthError extends Error {}
 
-/** 端末間で認証を移すための接続コードのペイロード */
+/**
+ * 端末間で認証を移すための接続コードのペイロード。
+ * v1 = 認証情報のみ / v2 = 共有設定（同期対象フォルダ等）も同梱。
+ * 生成は常に v2 だが、古い端末が出力した v1 も読める。
+ */
 interface ConnectionPayload {
-	v: 1;
+	v: 1 | 2;
 	clientId: string;
 	clientSecret: string;
 	tokens: {
@@ -29,6 +34,7 @@ interface ConnectionPayload {
 		refreshToken: string;
 		expiresAt: number;
 	};
+	shared?: Partial<SharedSettings>;
 }
 
 function base64UrlEncode(buffer: ArrayBuffer): string {
@@ -271,18 +277,19 @@ export class AuthManager {
 	// ---------------- 接続コード（端末間の認証移行） ----------------
 
 	/**
-	 * 認証済みのクレデンシャル+トークンを1つの文字列にまとめる。
-	 * モバイルに貼り付ければブラウザ往復なしで接続できる。
+	 * 認証済みのクレデンシャル+トークン+共有設定を1つの文字列にまとめる。
+	 * モバイルに貼り付ければブラウザ往復なしで接続でき、同期対象フォルダ等も引き継げる。
 	 * リフレッシュトークンを含むため、パスワードと同等に扱うこと。
 	 */
 	exportConnectionCode(): string | null {
 		const s = this.plugin.settings;
 		if (!s.clientId || !s.clientSecret || !s.tokens) return null;
 		const payload: ConnectionPayload = {
-			v: 1,
+			v: 2,
 			clientId: s.clientId,
 			clientSecret: s.clientSecret,
 			tokens: { ...s.tokens },
+			shared: pickSharedSettings(s),
 		};
 		const json = JSON.stringify(payload);
 		return btoa(unescape(encodeURIComponent(json)));
@@ -299,7 +306,7 @@ export class AuthManager {
 			return false;
 		}
 		if (
-			payload.v !== 1 ||
+			(payload.v !== 1 && payload.v !== 2) ||
 			!payload.clientId ||
 			!payload.clientSecret ||
 			!payload.tokens?.refreshToken
@@ -317,8 +324,10 @@ export class AuthManager {
 			expiresAt: 0,
 		};
 		s.pendingAuth = null;
+		// v1 のコードには shared が無い。その場合は既存の設定をそのまま残す
+		const applied = applySharedSettings(s, payload.shared);
 		await this.plugin.saveSettings();
-		new Notice(t.connectedWithCode);
+		new Notice(applied > 0 ? t.connectedWithCodeSettings(applied) : t.connectedWithCode);
 		this.plugin.onAuthenticated();
 		return true;
 	}

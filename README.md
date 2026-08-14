@@ -71,6 +71,8 @@ Copy the generated `main.js`, `manifest.json`, and `styles.css` into `<vault>/.o
 1. On the connected desktop, settings → *Connection code* → *Copy code*
 2. Send the code to your phone, paste it via *Enter code* in the plugin settings, then delete the message you used to transfer it — the code is equivalent to a password
 
+The code also carries the shared settings — the Drive folder, mirror base folder, exclude and always-sync patterns, maximum file size, upload debounce, and freshness interval — so a new device needs no re-entry. Device-specific settings (cache retention/count, *Enable on desktop*) are deliberately left alone, and nothing is applied unless you paste a code on that device.
+
 **Then, on the device that will sync (typically the phone):**
 
 1. *Choose from list* to pick the Drive folder to sync (pasting a Drive URL also works)
