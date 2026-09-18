@@ -1,7 +1,7 @@
 {
 	"id": "gdsync",
 	"name": "GDSync",
-	"version": "0.8.0",
+	"version": "0.8.1",
 	"minAppVersion": "1.4.0",
 	"description": "Mirror a Google Drive folder as stub files, download content on open, and upload edits automatically. Designed for mobile vaults.",
 	"author": "Yasuhiro Koyama",
