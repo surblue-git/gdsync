@@ -127,6 +127,18 @@ const en = {
 	syncing: "Syncing…",
 	syncFailed: "Sync failed",
 	possiblyOffline: "possibly offline",
+	syncAlreadyRunning: "GDSync: Sync is already running.",
+	syncNoChanges: "Sync finished (no changes).",
+	uploadingStatus: (name: string) => `Uploading ${name}…`,
+	uploadingStatusN: (n: number, name: string) =>
+		`Uploading ${n} files (e.g. ${name})…`,
+	syncClientUploads: (n: number, fail: number) =>
+		`uploaded ${n}${fail > 0 ? ` (${fail} failed)` : ""}`,
+	syncClientDownloads: (n: number) => `downloaded ${n}`,
+	syncClientRemote: (add: number, upd: number, del: number) =>
+		`remote +${add} / ~${upd} / −${del}`,
+	syncClientOps: (n: number) => `structure ops ${n}`,
+	syncFinished: (parts: string) => `Sync finished (${parts})`,
 
 	// ---- settings ----
 	modalEnterCodeTitle: "Enter connection code",
@@ -218,6 +230,9 @@ const en = {
 	unsentEdits: (n: number) =>
 		`GDSync: ${n} edit(s) have not been uploaded yet. Run "Sync now" first.`,
 	indexReset: "GDSync: Index has been reset. Run a full scan to rebuild it.",
+	syncNever: "never",
+	syncNoSummary: "No sync has been run yet.",
+	syncStateLabel: (last: string) => `Sync status: last sync ${last}`,
 };
 
 type Strings = typeof en;
@@ -312,6 +327,18 @@ const ja: Strings = {
 	syncing: "同期中…",
 	syncFailed: "同期に失敗しました",
 	possiblyOffline: "オフラインの可能性",
+	syncAlreadyRunning: "GDSync: 同期は既に実行中です。",
+	syncNoChanges: "同期完了（変更なし）。",
+	uploadingStatus: (name: string) => `${name} をアップロード中…`,
+	uploadingStatusN: (n: number, name: string) =>
+		`アップロード中… ${n}件（${name} ほか）`,
+	syncClientUploads: (n: number, fail: number) =>
+		`アップロード ${n}件${fail > 0 ? `（失敗 ${fail}）` : ""}`,
+	syncClientDownloads: (n: number) => `ダウンロード ${n}件`,
+	syncClientRemote: (add: number, upd: number, del: number) =>
+		`差分 追加 ${add} / 更新 ${upd} / 削除 ${del}`,
+	syncClientOps: (n: number) => `構造変更 ${n}件`,
+	syncFinished: (parts: string) => `同期完了（${parts}）`,
 
 	// ---- settings ----
 	modalEnterCodeTitle: "接続コードを入力",
@@ -403,6 +430,9 @@ const ja: Strings = {
 	unsentEdits: (n: number) =>
 		`GDSync: ${n} 件の編集がまだアップロードされていません。先に「今すぐ同期」を実行してください。`,
 	indexReset: "GDSync: インデックスをリセットしました。フルスキャンで再構築してください。",
+	syncNever: "なし",
+	syncNoSummary: "まだ同期を実行していません。",
+	syncStateLabel: (last: string) => `同期状態: 最終同期 ${last}`,
 };
 
 export const t: Strings = detectLang() === "ja" ? ja : en;

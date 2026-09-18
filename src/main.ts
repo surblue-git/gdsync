@@ -48,7 +48,7 @@ export default class GdsyncPlugin extends Plugin {
 		this.addCommand({
 			id: "sync-now",
 			name: t.cmdSyncNow,
-			callback: () => void this.engine.syncNow(),
+			callback: () => void this.engine.syncNow({ awaitUploads: true, notify: true }),
 		});
 		this.addCommand({
 			id: "evict-cache",
@@ -93,7 +93,7 @@ export default class GdsyncPlugin extends Plugin {
 		});
 
 		this.addRibbonIcon("refresh-cw", t.ribbonSyncNow, () =>
-			void this.engine.syncNow()
+			void this.engine.syncNow({ awaitUploads: true, notify: true })
 		);
 
 		// Vault イベントは起動時の初期スキャン（既存ファイル分の create 連発）を避けるため

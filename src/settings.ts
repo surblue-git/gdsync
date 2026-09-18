@@ -2,6 +2,7 @@ import {
 	App,
 	FuzzySuggestModal,
 	Modal,
+	moment,
 	Notice,
 	PluginSettingTab,
 	Setting,
@@ -398,11 +399,24 @@ export class GdsyncSettingTab extends PluginSettingTab {
 		// ---------- メンテナンス ----------
 		new Setting(containerEl).setName(t.headingMaintenance).setHeading();
 
+		// 前回の手動同期の結果（メモリ内のみ。詳細は最後の1〜数件を表示）
+		const stat = this.plugin.status.getSnapshot();
+		const lastAt = stat.lastSyncAt
+			? moment(stat.lastSyncAt).format("YYYY-MM-DD HH:mm")
+			: t.syncNever;
+		new Setting(containerEl)
+			.setName(t.syncStateLabel(lastAt))
+			.setDesc(stat.lastSummary ?? t.syncNoSummary);
+
 		new Setting(containerEl)
 			.setName(t.settingsSyncNow)
 			.setDesc(t.settingsSyncNowDesc)
 			.addButton((btn) =>
-				btn.setButtonText(t.btnSync).onClick(() => void this.plugin.engine.syncNow())
+				btn
+					.setButtonText(t.btnSync)
+					.onClick(() =>
+						void this.plugin.engine.syncNow({ awaitUploads: true, notify: true })
+					)
 			);
 
 		new Setting(containerEl)

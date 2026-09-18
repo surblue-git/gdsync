@@ -13,6 +13,10 @@ const MAX_BACKOFF_MS = 5 * 60 * 1000;
  */
 export class UploadQueue {
 	private items = new Map<string, QueueItem>();
+	/** 手動同期（drainPending）用: 少なくとも1回は実行を試みたパス */
+	private settled = new Set<string>();
+	private drainTargets: Set<string> | null = null;
+	private drainWaiters: Array<() => void> = [];
 
 	constructor(
 		private run: (path: string) => Promise<boolean>,
@@ -35,6 +39,8 @@ export class UploadQueue {
 		if (!item) return;
 		this.items.delete(oldPath);
 		window.clearTimeout(item.timer);
+		this.settled.add(oldPath);
+		this.notifySettled();
 		this.schedule(newPath);
 	}
 
@@ -43,6 +49,8 @@ export class UploadQueue {
 		if (item) {
 			window.clearTimeout(item.timer);
 			this.items.delete(path);
+			this.settled.add(path);
+			this.notifySettled();
 		}
 	}
 
@@ -62,10 +70,45 @@ export class UploadQueue {
 		this.items.clear();
 	}
 
+	/**
+	 * 呼び出し時点でキュー内にあるアイテムが「少なくとも1回は実行を試み、
+	 * その試行が完了する」のを待つ。
+	 * 失敗してバックオフ再スケジュールされた分は待たない（以降は自動リトライ）。
+	 * 空キューなら即解決。手動同期の完了サマリー集計用。
+	 */
+	async drainPending(): Promise<void> {
+		const keys = Array.from(this.items.keys());
+		if (keys.length === 0) return;
+		if (this.drainTargets) {
+			for (const k of keys) this.drainTargets.add(k);
+		} else {
+			this.drainTargets = new Set(keys);
+		}
+		if ([...this.drainTargets].every((p) => this.settled.has(p))) {
+			this.drainTargets = null;
+			this.settled.clear();
+			return;
+		}
+		await new Promise<void>((resolve) => this.drainWaiters.push(resolve));
+	}
+
 	private delayFor(failCount: number): number {
 		const base = this.baseDelayMs();
 		if (failCount === 0) return base;
 		return Math.min(MAX_BACKOFF_MS, base * Math.pow(2, failCount));
+	}
+
+	private notifySettled(): void {
+		const target = this.drainTargets;
+		if (!target) return;
+		for (const p of target) {
+			if (!this.settled.has(p)) return;
+		}
+		this.drainTargets = null;
+		const waiters = this.drainWaiters;
+		this.drainWaiters = [];
+		this.settled.clear();
+		for (const w of waiters) w();
 	}
 
 	private async execute(path: string): Promise<void> {
@@ -79,8 +122,12 @@ export class UploadQueue {
 			ok = false;
 		}
 		const cur = this.items.get(path);
-		// 実行中に再スケジュールされていたら触らない
-		if (cur !== item) return;
+		this.settled.add(path);
+		// 実行中に再スケジュールされていたら触らない（試行は完了扱い）
+		if (cur !== item) {
+			this.notifySettled();
+			return;
+		}
 		if (ok) {
 			this.items.delete(path);
 		} else {
@@ -92,5 +139,6 @@ export class UploadQueue {
 			);
 			this.items.set(path, { timer, failCount });
 		}
+		this.notifySettled();
 	}
 }

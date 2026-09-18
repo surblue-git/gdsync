@@ -522,7 +522,8 @@ export class SyncEngine {
 			new Notice(t.tooLarge(file.name));
 			return false;
 		}
-		this.status.set(t.downloading(file.name));
+		this.status.downloadStarting(file.name);
+		let ok = false;
 		try {
 			const data = await this.drive.download(entry.fileId);
 			await this.ops.writeContent(file, data);
@@ -533,12 +534,13 @@ export class SyncEngine {
 			entry.lastFreshCheck = Date.now();
 			this.index.markDirty();
 			await this.index.flush();
+			ok = true;
 			return true;
 		} catch (e) {
 			this.notifyError(t.downloadFailed(file.name), e);
 			return false;
 		} finally {
-			this.status.set("");
+			this.status.downloadFinished(ok);
 		}
 	}
 
@@ -753,6 +755,8 @@ export class SyncEngine {
 				new Notice(t.emptyUploadCancelled(file.name));
 				return true;
 			}
+			this.status.uploadStarting(file.name);
+			let ok = false;
 			try {
 				if (entry.fileId) {
 					// 競合チェック（他端末の更新を上書きしない）
@@ -778,6 +782,7 @@ export class SyncEngine {
 							remote.md5Checksum !== entry.hydratedMd5
 						) {
 							await this.resolveConflict(rel, file, entry, data, remote);
+							ok = true;
 							return true;
 						}
 					}
@@ -807,19 +812,24 @@ export class SyncEngine {
 				this.index.setFile(rel, entry);
 				await this.index.flush();
 				if (editedMeanwhile) this.queue.schedule(rel);
-				this.status.set("");
+				ok = true;
 				return true;
 			} catch (e) {
 				if (e instanceof AuthError) {
 					new Notice(`GDSync: ${e.message}`);
-					return true; // 再認証されるまでリトライしない（dirty は残る）
+					ok = false; // 未送信（要再認証）: 再認証されるまでリトライしない
+					return true;
 				}
 				if (e instanceof NetworkError) {
-					this.status.set(t.offlineUploadPending);
-					return false; // バックオフでリトライ
+					this.status.setOffline();
+					ok = false; // バックオフでリトライ
+					return false;
 				}
 				this.notifyError(t.uploadFailed(file.name), e);
+				ok = false;
 				return false;
+			} finally {
+				this.status.uploadFinished(file.name, ok);
 			}
 		});
 	}
@@ -880,6 +890,7 @@ export class SyncEngine {
 		const parentId = await this.ensureRemoteFolder(parentOf(rel));
 		const id = await this.drive.createFolder(baseName(rel), parentId);
 		this.index.setFolder(rel, id);
+		this.status.opFlushed();
 		return id;
 	}
 
@@ -922,11 +933,13 @@ export class SyncEngine {
 					}
 					this.index.data.pendingOps.shift();
 					this.index.markDirty();
+					this.status.opFlushed();
 				} catch (e) {
 					if (e instanceof ApiError && e.status === 404) {
 						// 対象が既に存在しない → スキップ
 						this.index.data.pendingOps.shift();
 						this.index.markDirty();
+						this.status.opFlushed();
 						continue;
 					}
 					break; // オフライン等 → 残して後で再試行
@@ -996,6 +1009,7 @@ export class SyncEngine {
 			} else {
 				await this.removeRemoteFileLocally(knownPath);
 			}
+			this.status.remoteChange("removed");
 			return;
 		}
 		if (!meta) return;
@@ -1006,6 +1020,7 @@ export class SyncEngine {
 				if (parentPath === undefined) {
 					// 対象ツリー外へ移動された
 					await this.removeRemoteFolderLocally(knownPath);
+					this.status.remoteChange("removed");
 					return;
 				}
 				const newRel = joinPath(parentPath, sanitizeName(meta.name));
@@ -1013,6 +1028,7 @@ export class SyncEngine {
 					const folder = this.ops.getFolder(this.toVault(knownPath));
 					if (folder) await this.ops.renameLocal(folder, this.toVault(newRel));
 					this.index.renameFolderPrefix(knownPath, newRel);
+					this.status.remoteChange("updated");
 				}
 			} else {
 				if (parentPath === undefined) return; // ツリー外
@@ -1020,6 +1036,7 @@ export class SyncEngine {
 				if (this.isExcluded(rel)) return;
 				await this.ops.ensureFolder(this.toVault(rel));
 				this.index.setFolder(rel, meta.id);
+				this.status.remoteChange("added");
 			}
 			return;
 		}
@@ -1033,10 +1050,12 @@ export class SyncEngine {
 			if (!entry) return;
 			if (parentPath === undefined) {
 				await this.removeRemoteFileLocally(knownPath);
+				this.status.remoteChange("removed");
 				return;
 			}
 			// リネーム/移動
 			let rel = knownPath;
+			let changed = false;
 			const newRel = joinPath(parentPath, sanitizeName(meta.name));
 			if (newRel !== knownPath && !this.isExcluded(newRel) && !this.index.getFile(newRel)) {
 				const f = this.ops.getFile(this.toVault(knownPath));
@@ -1044,6 +1063,7 @@ export class SyncEngine {
 				this.index.renameFile(knownPath, newRel);
 				this.queue.rename(knownPath, newRel);
 				rel = newRel;
+				changed = true;
 			}
 			// 内容更新
 			entry.remoteMd5 = meta.md5Checksum ?? null;
@@ -1057,6 +1077,7 @@ export class SyncEngine {
 				!entry.dirty &&
 				(entry.remoteMd5 ?? null) !== (entry.hydratedMd5 ?? null)
 			) {
+				changed = true;
 				await this.withLock(rel, async () => {
 					const f = this.ops.getFile(this.toVault(rel));
 					if (!f) return;
@@ -1072,6 +1093,7 @@ export class SyncEngine {
 					}
 				});
 			}
+			if (changed) this.status.remoteChange("updated");
 		} else {
 			if (parentPath === undefined) return;
 			const rel = joinPath(parentPath, sanitizeName(meta.name));
@@ -1089,6 +1111,7 @@ export class SyncEngine {
 				tooLarge:
 					num(meta.size) > this.plugin.settings.maxFileSizeMB * 1024 * 1024,
 			});
+			this.status.remoteChange("added");
 			// eager 指定なら新規スタブをその場で実体化
 			if (this.isEager(rel)) await this.hydrateStubRel(rel);
 		}
@@ -1146,19 +1169,52 @@ export class SyncEngine {
 
 	// ---------------- 同期・キャッシュ管理 ----------------
 
-	/** 起動時/復帰時/手動: 保留分を流してから差分を取得 */
-	async syncNow(): Promise<void> {
-		if (this.syncing || this.scanning) return;
+	/**
+	 * 同期を実行する。自動（起動時/復帰時）はアップロードを投げっぱなしで素早く返し、
+	 * 手動（awaitUploads=true）はアップロード完了まで待って集計し、完了サマリーを通知する。
+	 */
+	async syncNow(opts?: { awaitUploads?: boolean; notify?: boolean }): Promise<void> {
+		const awaitUploads = opts?.awaitUploads ?? false;
+		const notify = opts?.notify ?? false;
+		if (this.scanning) {
+			if (notify) new Notice(t.scanAlreadyRunning);
+			return;
+		}
+		if (this.syncing) {
+			if (notify) new Notice(t.syncAlreadyRunning);
+			return;
+		}
+		if (awaitUploads) {
+			// 手動同期: 完了まで待って集計し、要約を通知する
+			this.syncing = true;
+			this.status.beginSync();
+			try {
+				await this.flushPendingOps();
+				await this.tryEnsureRemoteFolders();
+				for (const rel of this.index.dirtyPaths()) this.queue.schedule(rel, true);
+				await this.queue.drainPending();
+				await this.pullChanges();
+				const summary = this.status.endSync();
+				if (notify) {
+					if (summary) new Notice(`GDSync: ${summary}`, 6000);
+					else new Notice(`GDSync: ${t.syncNoChanges}`, 3000);
+				}
+			} catch (e) {
+				this.status.endSync();
+				if (!(e instanceof NetworkError)) this.notifyError(t.syncFailed, e);
+			} finally {
+				this.syncing = false;
+			}
+			return;
+		}
+		// 自動同期: 通知なし。アップロードはバックグラウンドのキューが継続する
 		this.syncing = true;
 		try {
-			this.status.set(t.syncing);
 			await this.flushPendingOps();
 			await this.tryEnsureRemoteFolders();
 			for (const rel of this.index.dirtyPaths()) this.queue.schedule(rel, true);
 			await this.pullChanges();
-			this.status.set("");
 		} catch (e) {
-			this.status.set("");
 			if (!(e instanceof NetworkError)) this.notifyError(t.syncFailed, e);
 		} finally {
 			this.syncing = false;
