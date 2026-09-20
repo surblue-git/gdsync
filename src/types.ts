@@ -22,6 +22,7 @@ export interface GdsyncSettings {
 	rootFolderName: string;
 	/** Vault 内のミラー先ベースフォルダ */
 	baseFolder: string;
+	mountMode: "subfolder" | "vaultRoot";
 	/** これを超えるファイルはハイドレートしない (MB) */
 	maxFileSizeMB: number;
 	/** この日数アクセスがないキャッシュは脱ハイドレート */
@@ -52,6 +53,7 @@ export const DEFAULT_SETTINGS: GdsyncSettings = {
 	rootFolderId: "",
 	rootFolderName: "",
 	baseFolder: "GDrive",
+	mountMode: "subfolder",
 	maxFileSizeMB: 20,
 	cacheMaxAgeDays: 14,
 	cacheMaxCount: 200,
@@ -71,11 +73,11 @@ export const DEFAULT_SETTINGS: GdsyncSettings = {
  * - enableOnDesktop … 端末の役割で決まる（母艦で勝手に有効化されると事故る）
  * - cacheMaxAgeDays / cacheMaxCount … 端末の空き容量に依存する
  * - redirectUri … モバイル単体認証用で、端末ごとに要否が違う
+ * - mountMode / baseFolder … 端末固有の配置。稼働中の同期先をコードで変更しない
  */
 export const SHARED_SETTING_KEYS = [
 	"rootFolderId",
 	"rootFolderName",
-	"baseFolder",
 	"excludePatterns",
 	"eagerSyncPatterns",
 	"maxFileSizeMB",
@@ -89,7 +91,6 @@ export type SharedSettings = Pick<GdsyncSettings, (typeof SHARED_SETTING_KEYS)[n
 const TRIMMED_SHARED_KEYS: ReadonlySet<string> = new Set([
 	"rootFolderId",
 	"rootFolderName",
-	"baseFolder",
 ]);
 
 export function pickSharedSettings(s: GdsyncSettings): SharedSettings {
@@ -109,6 +110,7 @@ export function applySharedSettings(target: GdsyncSettings, incoming: unknown): 
 	const src = incoming as Record<string, unknown>;
 	const patch: Record<string, unknown> = {};
 	for (const key of SHARED_SETTING_KEYS) {
+		if ((key === "rootFolderId" || key === "rootFolderName") && target.rootFolderId) continue;
 		let v = src[key];
 		if (typeof v !== typeof DEFAULT_SETTINGS[key]) continue;
 		if (typeof v === "number") {
@@ -117,8 +119,6 @@ export function applySharedSettings(target: GdsyncSettings, incoming: unknown): 
 			if (!Number.isFinite(v) || v < min) continue;
 		}
 		if (typeof v === "string" && TRIMMED_SHARED_KEYS.has(key)) v = v.trim();
-		// baseFolder が空だと isActive() が永久に false になるので引き継がない
-		if (key === "baseFolder" && !v) continue;
 		patch[key] = v;
 	}
 	Object.assign(target, patch);
@@ -136,6 +136,13 @@ export interface IndexEntry {
 	hydrated: boolean;
 	/** ローカル編集がまだアップロードされていない */
 	dirty: boolean;
+	/** Incremented on local edits; an upload only acknowledges its captured revision. */
+	revision?: number;
+	localMtime?: number;
+	localSize?: number;
+	/** Persisted before creating a remote file, for idempotent retry. */
+	creationId?: string;
+	conflictCopy?: { rel: string; creationId: string; revision: number };
 	/** キャッシュ追い出し判定用 */
 	lastAccess: number;
 	/** ハイドレートした時点のリモートmd5 */
@@ -148,12 +155,12 @@ export interface IndexEntry {
 
 export type PendingOp =
 	| {
-			kind: "renameRemote";
-			fileId: string;
-			newName: string;
-			/** ベースフォルダ相対の移動先親フォルダパス（'' はルート） */
-			newParentPath: string;
-	  }
+		kind: "renameRemote";
+		fileId: string;
+		newName: string;
+		/** ベースフォルダ相対の移動先親フォルダパス（'' はルート） */
+		newParentPath: string;
+	}
 	| { kind: "trashRemote"; fileId: string };
 
 export interface GdsyncIndex {
@@ -161,6 +168,10 @@ export interface GdsyncIndex {
 	rootFolderId: string;
 	changesPageToken: string | null;
 	lastFullScan: number;
+	mountBase?: string;
+	/** Durable changes received but not yet applied. */
+	incoming?: DriveChange[];
+	folderCreationIds?: Record<string, string>;
 	/** key = ベースフォルダ相対の normalizePath 済みパス */
 	files: Record<string, IndexEntry>;
 	/** path → Drive folderId（'' はローカルのみでまだ Drive に未作成） */
@@ -182,6 +193,7 @@ export function emptyIndex(): GdsyncIndex {
 }
 
 export interface DriveItemMeta {
+	gdsyncRecovered?: boolean;
 	id: string;
 	name: string;
 	mimeType: string;

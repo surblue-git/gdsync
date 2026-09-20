@@ -1,4 +1,4 @@
-import { FileView, Notice, TFile, TFolder, normalizePath } from "obsidian";
+import { FileView, Notice, TFile, TFolder } from "obsidian";
 import { AuthError } from "./auth";
 import {
 	ApiError,
@@ -14,6 +14,9 @@ import { DriveChange, DriveItemMeta, IndexEntry } from "./types";
 import { UploadQueue } from "./upload-queue";
 import { sanitizeName, VaultOps } from "./vault-ops";
 import type GdsyncPlugin from "./main";
+import { mountBase, relativePath, vaultPath, protectedPath } from "./sync-paths";
+import { attachmentReferences, freshLinkCache, invalidateLinkCache } from "./attachment-links";
+import { MountMigration } from "./mount-migration";
 
 const MIME_BY_EXT: Record<string, string> = {
 	md: "text/markdown",
@@ -76,9 +79,16 @@ function yieldToUI(): Promise<void> {
 export class SyncEngine {
 	queue: UploadQueue;
 	private locks = new Map<string, Promise<void>>();
+	private lockKeys = new WeakMap<IndexEntry, string>();
+	private nextLock = 0;
 	private scanning = false;
 	private syncing = false;
-	private flushingOps = false;
+	private folderTasks = new Map<string, Promise<string>>();
+	private opsTask: Promise<void> | null = null;
+	migrating = false;
+	private pendingIssues = new Set<string>();
+	private openAttachments = new Set<string>();
+	private migrationRunning = false;
 
 	constructor(
 		private plugin: GdsyncPlugin,
@@ -96,22 +106,103 @@ export class SyncEngine {
 	// ---------------- パスヘルパー ----------------
 
 	basePath(): string {
-		return normalizePath(this.plugin.settings.baseFolder);
+		return mountBase(this.plugin.settings.mountMode, this.plugin.settings.baseFolder);
 	}
 
 	toVault(rel: string): string {
-		return rel ? `${this.basePath()}/${rel}` : this.basePath();
+		return vaultPath(this.basePath(), rel);
 	}
 
 	/** Vault パス → ベースフォルダ相対パス。対象外なら null、ベース自身は "" */
 	toRel(vaultPath: string): string | null {
-		const base = this.basePath();
-		if (vaultPath === base) return "";
-		if (vaultPath.startsWith(base + "/")) return vaultPath.slice(base.length + 1);
-		return null;
+		return relativePath(this.basePath(), vaultPath);
+	}
+
+	private assertTarget(): void {
+		if (!this.index.ready || this.migrating) throw new Error(t.syncNotReady);
+		const d = this.index.data;
+		if ((d.rootFolderId && d.rootFolderId !== this.plugin.settings.rootFolderId) ||
+			(d.mountBase !== undefined && d.mountBase !== this.basePath())) throw new Error(t.targetChanged);
+		if (!this.plugin.isActive()) throw new Error(t.syncNotReady);
+	}
+
+	canChangeTarget(): boolean {
+		return this.index.ready && !this.isBusy() && !this.index.data.incoming?.length &&
+			Object.keys(this.index.data.files).length === 0 &&
+			Object.keys(this.index.data.folders).length === 0 && !this.index.data.pendingOps.length;
+	}
+
+	isBusy(): boolean {
+		return this.scanning || this.syncing || this.migrating || this.migrationRunning || !!this.opsTask || this.locks.size > 0 || this.folderTasks.size > 0;
+	}
+
+	private rememberLocal(file: TFile, entry: IndexEntry): void {
+		entry.localMtime = file.stat.mtime;
+		entry.localSize = file.stat.size;
+	}
+
+	async restoreMigrationState(): Promise<void> {
+		this.migrating = await new MountMigration(this.plugin).pending();
+		if (this.migrating) new Notice(t.migrationResume, 15000);
+	}
+
+	async migrateToRoot(): Promise<string[]> {
+		if (this.syncing || this.scanning || this.migrationRunning) throw new Error(t.syncAlreadyRunning);
+		this.migrationRunning = true;
+		const migration = new MountMigration(this.plugin);
+		try {
+			const pending = await migration.pending();
+			if (!pending) this.assertTarget();
+			if (this.index.data.pendingOps.length || this.index.data.incoming?.length) throw new Error(t.migrationPendingOps);
+			this.migrating = true;
+			try {
+				await this.queue.pause();
+				await Promise.all(Array.from(this.locks.values()));
+				if (this.opsTask) await this.opsTask;
+				if (!pending) {
+					for (const [rel, entry] of Object.entries(this.index.data.files)) {
+						if (!/\.(md|canvas)$/i.test(rel) || entry.hydrated) continue;
+						this.status.progress(`${t.migrateRoot}: ${rel}`);
+						await this.hydrateStubRel(rel);
+						if (!entry.hydrated) throw new Error(`${t.uncheckedStub}: ${rel}`);
+					}
+					await new Promise((resolve) => setTimeout(resolve, 250));
+				}
+				const warnings = await migration.run();
+				this.migrating = false;
+				this.ops.suppressor.clear();
+				return warnings;
+			} finally {
+				this.migrating = await migration.pending();
+				this.status.endProgress();
+				if (!this.migrating) this.queue.resume();
+			}
+		} finally { this.migrationRunning = false; }
+	}
+
+	/** Detect edits made while the app was closed; unknown files are always real data. */
+	private async reconcileLocal(): Promise<void> {
+		for (const file of this.plugin.app.vault.getFiles()) {
+			const rel = this.toRel(file.path);
+			if (!rel || this.isExcluded(rel)) continue;
+			const e = this.index.getFile(rel);
+			if (!e) this.trackNewLocalFile(rel);
+			else if ((e.hydrated && e.localMtime === undefined) || (e.localMtime !== undefined &&
+				(e.localMtime !== file.stat.mtime || e.localSize !== file.stat.size)) ||
+				(!e.hydrated && file.stat.size > 0)) {
+				e.hydrated = true;
+				e.dirty = true;
+				e.revision = (e.revision ?? 0) + 1;
+				this.rememberLocal(file, e);
+				this.index.markDirty();
+			}
+		}
+		await this.index.flush();
 	}
 
 	private isExcluded(rel: string): boolean {
+		if (protectedPath(rel, this.plugin.app.vault.configDir) ||
+			protectedPath(this.toVault(rel), this.plugin.app.vault.configDir)) return true;
 		const patterns = this.plugin.settings.excludePatterns
 			.split("\n")
 			.map((p) => p.trim())
@@ -121,7 +212,7 @@ export class SyncEngine {
 		// baseFolder が PC 側で Drive 同期対象と重なっていると、GDSync が作ったローカルの
 		// ミラーフォルダを外部の同期クライアント(Drive for Desktop等)が拾ってDriveへ
 		// アップロードしてしまい、次のスキャンでそれを再度ミラーする無限入れ子ループが起きる。
-		const baseName = this.plugin.settings.baseFolder.split("/").pop()?.toLowerCase();
+		const baseName = this.basePath().split("/").pop()?.toLowerCase();
 		if (baseName) {
 			const segments = rel.toLowerCase().split("/");
 			if (segments.includes(baseName)) return true;
@@ -169,6 +260,7 @@ export class SyncEngine {
 	 * （オンデマンドの利点を保ったまま、見ているノートの画像は自動で揃う）。
 	 */
 	async hydrateEmbedsOf(file: TFile): Promise<void> {
+		if (this.migrating || this.scanning) return;
 		if (file.extension !== "md") return;
 		const cache = this.plugin.app.metadataCache.getFileCache(file);
 		if (!cache) return;
@@ -186,24 +278,59 @@ export class SyncEngine {
 			if (seen.has(rel)) continue;
 			seen.add(rel);
 			const entry = this.index.getFile(rel);
-			if (!entry || !entry.fileId || entry.hydrated || entry.dirty || entry.tooLarge) {
+			if (!entry || !entry.fileId || entry.dirty || entry.tooLarge) {
 				continue;
 			}
-			await this.hydrateStubRel(rel);
+			this.openAttachments.add(rel);
+			entry.lastAccess = Date.now();
+			if (dest.extension === "md") await this.hydrateStubRel(rel);
+			else await this.onFileOpen(dest);
 		}
+	}
+
+	async diagnoseAttachments(): Promise<string[]> {
+		const issues: string[] = [];
+		for (const file of this.plugin.app.vault.getMarkdownFiles()) {
+			const rel = this.toRel(file.path);
+			if (!rel || this.isExcluded(rel)) continue;
+			const entry = this.index.getFile(rel);
+			if (entry && !entry.hydrated) { issues.push(`${file.path}: ${t.uncheckedStub}`); continue; }
+			for (const ref of attachmentReferences(this.plugin.app, file)) {
+				const target = ref.file ? this.toRel(ref.file.path) : null;
+				const reason = !ref.file ? t.linkMissing : !target || this.isExcluded(target) ? t.linkOutside
+					: this.index.getFile(target)?.dirty ? t.linkPending : null;
+				if (reason) issues.push(`${file.path} → ${ref.link}: ${reason}`);
+			}
+		}
+		return issues;
+	}
+
+	private async uploadAttachments(file: TFile, text: string): Promise<boolean> {
+		if (file.extension !== "md") return true;
+		if (!freshLinkCache(this.plugin.app, file, text)) return false;
+		for (const ref of attachmentReferences(this.plugin.app, file)) {
+			const rel = ref.file ? this.toRel(ref.file.path) : null;
+			if (!ref.file || !rel || this.isExcluded(rel)) { this.pendingIssues.add(file.path); return false; }
+			if (!this.index.getFile(rel)) this.trackNewLocalFile(rel);
+			if (this.index.getFile(rel)?.dirty) await this.performUpload(rel);
+			if (this.index.getFile(rel)?.dirty || !this.index.getFile(rel)?.fileId) return false;
+		}
+		return true;
 	}
 
 	/** per-file 直列化。ハイドレートとアップロードの競走を防ぐ */
 	private withLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+		const entry = this.index.getFile(key);
+		if (entry) {
+			let stableKey = this.lockKeys.get(entry);
+			if (!stableKey) { stableKey = `file:${++this.nextLock}`; this.lockKeys.set(entry, stableKey); }
+			key = stableKey;
+		}
 		const prev = this.locks.get(key) || Promise.resolve();
 		const run = prev.then(fn, fn);
-		this.locks.set(
-			key,
-			run.then(
-				() => undefined,
-				() => undefined
-			)
-		);
+		const settled = run.then(() => undefined, () => undefined);
+		this.locks.set(key, settled);
+		void settled.then(() => { if (this.locks.get(key) === settled) this.locks.delete(key); });
 		return run;
 	}
 
@@ -229,18 +356,23 @@ export class SyncEngine {
 	 * Drive 全体を一括リストしてツリーを再構成し、スタブを生成する。
 	 * 冪等: 既存スタブ・既存インデックスとの差分のみ適用。
 	 */
-	async fullScan(): Promise<void> {
+	async fullScan(internal = false): Promise<void> {
+		try { this.assertTarget(); } catch (e) { this.notifyError(t.scanFailed, e); return; }
 		const s = this.plugin.settings;
 		if (!s.rootFolderId) {
 			new Notice(t.noFolderSelected);
 			return;
 		}
-		if (this.scanning) {
+		if (this.scanning || this.migrationRunning || (this.syncing && !internal)) {
 			new Notice(t.scanAlreadyRunning);
 			return;
 		}
 		this.scanning = true;
 		try {
+			await this.queue.pause();
+			await Promise.all(Array.from(this.locks.values()));
+			if (this.opsTask) await this.opsTask;
+			await this.reconcileLocal();
 			// ルートフォルダの実在＆種別を検証。無効なIDだと BFS が空振りして
 			// 「既存は見えるが新規だけ永遠に同期されない」紛らわしい失敗になるため、
 			// リスト取得の前に弾いて明確に通知する。
@@ -259,6 +391,7 @@ export class SyncEngine {
 				} else if (e instanceof NetworkError) {
 					new Notice(`GDSync: ${t.possiblyOffline}`, 12000);
 				} else {
+					this.pendingIssues.add("scan");
 					this.notifyError(t.scanFailed, e);
 				}
 				return;
@@ -290,7 +423,7 @@ export class SyncEngine {
 			];
 			while (queue.length) {
 				const cur = queue.shift()!;
-				const kids = children.get(cur.id) || [];
+				const kids = (children.get(cur.id) || []).sort((a, b) => a.id.localeCompare(b.id));
 				const usedNames = new Set<string>();
 				for (const kid of kids) {
 					if (kid.trashed) continue;
@@ -324,7 +457,7 @@ export class SyncEngine {
 			// 診断ログ（開発者コンソール用）
 			console.debug(
 				`gdsync: fullScan — total items=${items.length}, ` +
-					`folders=${remoteFolders.size}, files=${remoteFiles.size}`
+				`folders=${remoteFolders.size}, files=${remoteFiles.size}`
 			);
 			if (remoteFiles.size === 0 && remoteFolders.size > 0) {
 				new Notice(t.foldersNoFiles, 15000);
@@ -349,7 +482,11 @@ export class SyncEngine {
 			for (const [rel, meta] of remoteFiles) {
 				i++;
 				try {
-					const existing = this.index.getFile(rel);
+					let existing = this.index.getFile(rel);
+					if (!existing && this.ops.getFile(this.toVault(rel))) {
+						this.trackNewLocalFile(rel);
+						existing = this.index.getFile(rel);
+					}
 					if (!existing) {
 						await this.ops.createStub(this.toVault(rel));
 						this.index.setFile(rel, {
@@ -366,6 +503,7 @@ export class SyncEngine {
 					} else {
 						const localFile = this.ops.getFile(this.toVault(rel));
 						if (!localFile) {
+							if (existing.dirty) throw new Error("Missing unsent local file: " + rel);
 							// インデックスには記録があるが実体が存在しない
 							// （手動削除・アプリ外操作・古いrootFolderIdからの切替等で
 							// パスが偶然一致した場合を含む）→ スタブを作り直して自己修復する
@@ -376,24 +514,9 @@ export class SyncEngine {
 							existing.dirty = false;
 							created++;
 						} else if (existing.fileId !== meta.id) {
-							// 別ファイルに置き換わっていた → キャッシュ無効化
 							existing.fileId = meta.id;
-							if (existing.hydrated && !existing.dirty) {
-								await this.ops.truncateToStub(localFile);
-								existing.hydrated = false;
-								existing.hydratedMd5 = undefined;
-							}
-						} else {
-							const newMd5 = meta.md5Checksum ?? null;
-							if (
-								existing.hydrated &&
-								!existing.dirty &&
-								newMd5 !== (existing.hydratedMd5 ?? null)
-							) {
-								await this.ops.truncateToStub(localFile);
-								existing.hydrated = false;
-								existing.hydratedMd5 = undefined;
-							}
+							// Preserve cached bytes. A later guarded download compares the new remote hash.
+							existing.hydratedMd5 = undefined;
 						}
 						existing.remoteMd5 = meta.md5Checksum ?? null;
 						existing.remoteModifiedTime = ts(meta.modifiedTime);
@@ -408,6 +531,9 @@ export class SyncEngine {
 						firstError = `${rel}: ${e instanceof Error ? e.message : String(e)}`;
 					}
 					console.error("gdsync: failed to create stub", rel, e);
+					this.pendingIssues.add(rel);
+					const incoming = this.index.data.incoming ?? (this.index.data.incoming = []);
+					if (!incoming.some((change) => change.fileId === meta.id)) incoming.push({ fileId: meta.id, file: meta, removed: false });
 				}
 				if (i % 50 === 0) {
 					this.status.progress(t.creatingStubs(i, remoteFiles.size));
@@ -417,11 +543,12 @@ export class SyncEngine {
 
 			// リモートに存在しなくなったもの
 			for (const rel of Object.keys(this.index.data.files)) {
+				if (this.isExcluded(rel)) continue;
 				if (remoteFiles.has(rel)) continue;
 				const entry = this.index.getFile(rel)!;
 				if (entry.dirty || !entry.fileId) {
 					// ローカル編集/新規はアップロード対象として残す（fileId をクリアして新規作成へ）
-					if (entry.dirty) entry.fileId = "";
+					if (entry.dirty) { entry.fileId = ""; entry.creationId = undefined; }
 					this.index.setFile(rel, entry);
 					continue;
 				}
@@ -446,6 +573,7 @@ export class SyncEngine {
 			await this.hydrateEagerFiles();
 
 			this.index.data.rootFolderId = s.rootFolderId;
+			this.index.data.mountBase = this.basePath();
 			this.index.data.changesPageToken = startToken;
 			this.index.data.lastFullScan = Date.now();
 			this.index.markDirty();
@@ -461,15 +589,19 @@ export class SyncEngine {
 			}
 		} catch (e) {
 			this.status.endProgress();
+			this.pendingIssues.add("scan");
 			this.notifyError(t.scanFailed, e);
 		} finally {
 			this.scanning = false;
+			if (!internal) this.queue.resume();
 		}
 	}
 
 	// ---------------- ハイドレート ----------------
 
 	async onFileOpen(file: TFile): Promise<void> {
+		if (this.scanning || this.migrating) return;
+		this.assertTarget();
 		const rel = this.toRel(file.path);
 		if (rel === null || rel === "") return;
 		const entry = this.index.getFile(rel);
@@ -515,6 +647,10 @@ export class SyncEngine {
 
 	/** 実体をダウンロードしてファイルへ書き込む。呼び出し側でロック取得済みであること */
 	private async downloadInto(file: TFile, entry: IndexEntry): Promise<boolean> {
+		const revision = entry.revision ?? 0;
+		const expectedMtime = file.stat.mtime;
+		const expectedPath = file.path;
+		const remoteMd5 = entry.remoteMd5;
 		const maxSize = this.plugin.settings.maxFileSizeMB * 1024 * 1024;
 		if (entry.remoteSize > maxSize) {
 			entry.tooLarge = true;
@@ -522,31 +658,36 @@ export class SyncEngine {
 			new Notice(t.tooLarge(file.name));
 			return false;
 		}
-		this.status.downloadStarting(file.name);
+		const transfer = this.status.downloadStarting(file.path);
 		let ok = false;
 		try {
 			const data = await this.drive.download(entry.fileId);
-			await this.ops.writeContent(file, data);
+			const unchanged = () => (entry.revision ?? 0) === revision &&
+				file.path === expectedPath && file.stat.mtime === expectedMtime && !entry.dirty;
+			if (!await this.ops.writeContent(file, data, unchanged)) return false;
 			entry.hydrated = true;
-			entry.hydratedMd5 = entry.remoteMd5 ?? undefined;
+			entry.hydratedMd5 = remoteMd5 ?? undefined;
 			entry.dirty = false;
 			entry.lastAccess = Date.now();
 			entry.lastFreshCheck = Date.now();
+			this.rememberLocal(file, entry);
 			this.index.markDirty();
 			await this.index.flush();
 			ok = true;
 			return true;
 		} catch (e) {
+			this.pendingIssues.add(expectedPath);
 			this.notifyError(t.downloadFailed(file.name), e);
 			return false;
 		} finally {
-			this.status.downloadFinished(ok);
+			this.status.downloadFinished(transfer, ok);
 		}
 	}
 
 	// ---------------- Vault イベント ----------------
 
 	onModify(file: TFile): void {
+		invalidateLinkCache(file);
 		if (this.ops.suppressor.consume(file.path)) return;
 		const rel = this.toRel(file.path);
 		if (rel === null || rel === "") return;
@@ -559,9 +700,13 @@ export class SyncEngine {
 		if (!entry.hydrated && entry.fileId) {
 			// ガード1: 未ハイドレートのスタブ編集はアップロードさせない
 			new Notice(t.stubEditWarning);
-			return;
+			// Preserve the edit. With no baseline, upload creates a conflict copy.
+			entry.hydrated = true;
+			entry.hydratedMd5 = undefined;
 		}
 		entry.dirty = true;
+		entry.revision = (entry.revision ?? 0) + 1;
+		this.rememberLocal(file, entry);
 		this.index.markDirty();
 		this.queue.schedule(rel);
 	}
@@ -574,7 +719,7 @@ export class SyncEngine {
 		if (af instanceof TFolder) {
 			if (this.index.getFolderId(rel) === undefined) {
 				this.index.setFolder(rel, "");
-				void this.tryEnsureRemoteFolders();
+				if (!this.scanning && !this.syncing) void this.tryEnsureRemoteFolders().catch((e) => this.notifyError(t.syncFailed, e));
 			}
 			return;
 		}
@@ -583,6 +728,7 @@ export class SyncEngine {
 	}
 
 	private trackNewLocalFile(rel: string): void {
+		const file = this.ops.getFile(this.toVault(rel));
 		this.index.setFile(rel, {
 			fileId: "",
 			remoteMd5: null,
@@ -590,6 +736,9 @@ export class SyncEngine {
 			remoteSize: 0,
 			hydrated: true, // ローカル生まれ = ローカルが実体
 			dirty: true,
+			revision: 1,
+			localMtime: file?.stat.mtime,
+			localSize: file?.stat.size,
 			lastAccess: Date.now(),
 		});
 		this.queue.schedule(rel);
@@ -614,7 +763,7 @@ export class SyncEngine {
 			this.index.deleteFile(rel);
 		}
 		this.index.markDirty();
-		void this.flushPendingOps();
+		if (!this.scanning && !this.syncing) void this.flushPendingOps().catch((e) => this.notifyError(t.syncFailed, e));
 	}
 
 	/** ローカルで消えたフォルダ配下のインデックスを整理。trashRemote=true ならリモートもゴミ箱へ */
@@ -644,6 +793,8 @@ export class SyncEngine {
 		// ベースフォルダ自体のリネームは設定へ追従
 		if (oldPath === this.basePath() && af instanceof TFolder) {
 			this.plugin.settings.baseFolder = af.path;
+			this.index.data.mountBase = af.path;
+			this.index.markDirty();
 			void this.plugin.saveSettings();
 			return;
 		}
@@ -685,7 +836,7 @@ export class SyncEngine {
 				}
 			}
 			this.index.markDirty();
-			void this.flushPendingOps();
+			if (!this.scanning && !this.syncing) void this.flushPendingOps().catch((e) => this.notifyError(t.syncFailed, e));
 		} else if (oldRel !== null && oldRel !== "" && newRel === null) {
 			// ベース外へ移動 → Drive 上はゴミ箱へ（復元可能な保険）
 			if (af instanceof TFolder) {
@@ -704,7 +855,7 @@ export class SyncEngine {
 				}
 			}
 			this.index.markDirty();
-			void this.flushPendingOps();
+			if (!this.scanning && !this.syncing) void this.flushPendingOps().catch((e) => this.notifyError(t.syncFailed, e));
 		} else if (oldRel === null && newRel !== null && newRel !== "") {
 			// ベース外から移入 → 新規としてアップロード対象に
 			if (af instanceof TFolder) {
@@ -731,7 +882,7 @@ export class SyncEngine {
 				}
 			}
 		}
-		void this.tryEnsureRemoteFolders();
+		if (!this.scanning && !this.syncing) void this.tryEnsureRemoteFolders().catch((e) => this.notifyError(t.syncFailed, e));
 	}
 
 	// ---------------- アップロード ----------------
@@ -739,23 +890,29 @@ export class SyncEngine {
 	/** UploadQueue から呼ばれる。true=完了(またはリトライ不要)、false=リトライ */
 	private async performUpload(rel: string): Promise<boolean> {
 		return this.withLock(rel, async () => {
+			this.assertTarget();
+			if (this.isExcluded(rel)) return true;
 			const entry = this.index.getFile(rel);
 			if (!entry || !entry.dirty) return true;
 			if (!entry.hydrated) return true; // ガード2: 実体なしは絶対に送らない
 			const file = this.ops.getFile(this.toVault(rel));
 			if (!file) return true; // 既に消えていた
+			const revision = entry.revision ?? 0;
+			const mtimeBeforeUpload = file.stat.mtime;
 			let data: ArrayBuffer;
 			try {
 				data = await this.ops.readBinary(file);
 			} catch (e) {
 				return false;
 			}
+			if (file.extension === "md" && !await this.uploadAttachments(file, new TextDecoder().decode(data))) return false;
+			if ((entry.revision ?? 0) !== revision || file.stat.mtime !== mtimeBeforeUpload) return false;
 			// ガード3: ローカルが空でリモートに内容がある場合は事故防止のため送らない
-			if (data.byteLength === 0 && entry.remoteSize > 0) {
+			if (data.byteLength === 0 && entry.remoteSize > 0 && !entry.hydratedMd5) {
 				new Notice(t.emptyUploadCancelled(file.name));
 				return true;
 			}
-			this.status.uploadStarting(file.name);
+			const transfer = this.status.uploadStarting(file.path);
 			let ok = false;
 			try {
 				if (entry.fileId) {
@@ -768,6 +925,7 @@ export class SyncEngine {
 						);
 					} catch (e) {
 						if (e instanceof ApiError && e.status === 404) {
+							entry.creationId = undefined;
 							entry.fileId = ""; // リモートで完全削除済み → 新規作成
 						} else {
 							throw e;
@@ -775,13 +933,13 @@ export class SyncEngine {
 					}
 					if (remote) {
 						if (remote.trashed) {
+							entry.creationId = undefined;
 							entry.fileId = ""; // ゴミ箱行き → 新規作成で復活
 						} else if (
 							remote.md5Checksum &&
-							entry.hydratedMd5 &&
 							remote.md5Checksum !== entry.hydratedMd5
 						) {
-							await this.resolveConflict(rel, file, entry, data, remote);
+							await this.resolveConflict(rel, file, entry, data, remote, revision);
 							ok = true;
 							return true;
 						}
@@ -791,27 +949,49 @@ export class SyncEngine {
 				const parentId = isNew
 					? await this.ensureRemoteFolder(parentOf(rel))
 					: undefined;
-				const mtimeBeforeUpload = file.stat.mtime;
+				if (isNew && !entry.creationId) {
+					entry.creationId = await this.drive.generateId();
+					this.index.markDirty();
+					await this.index.flush();
+				}
 				const res = await this.drive.upload({
+					creationId: entry.creationId,
 					fileId: entry.fileId || undefined,
 					name: isNew ? file.name : undefined,
 					parentId,
 					mimeType: mimeFor(file.extension),
 					data,
 				});
+				// A user may rename/delete the file while the request is in flight.
+				const currentRel = this.toRel(file.path);
+				if (!currentRel || this.index.getFile(currentRel) !== entry) {
+					this.index.data.pendingOps.push({ kind: "trashRemote", fileId: res.id });
+					this.index.markDirty();
+					await this.index.flush();
+					return true;
+				}
+				if (currentRel !== rel) {
+					this.index.data.pendingOps.push({
+						kind: "renameRemote", fileId: res.id,
+						newName: file.name, newParentPath: parentOf(currentRel)
+					});
+				}
 				entry.fileId = res.id;
 				entry.remoteMd5 = res.md5Checksum ?? null;
 				entry.remoteModifiedTime = ts(res.modifiedTime);
 				entry.remoteSize = num(res.size);
-				entry.hydratedMd5 = res.md5Checksum;
+				if (!res.gdsyncRecovered) entry.hydratedMd5 = res.md5Checksum;
 				// アップロード中に再編集されていたら dirty を維持して再送
-				const nowFile = this.ops.getFile(this.toVault(rel));
+				const nowFile = this.ops.getFile(this.toVault(currentRel));
 				const editedMeanwhile =
+					!!res.gdsyncRecovered ||
+					(entry.revision ?? 0) !== revision ||
 					!!nowFile && nowFile.stat.mtime !== mtimeBeforeUpload;
 				entry.dirty = editedMeanwhile;
-				this.index.setFile(rel, entry);
+				if (nowFile && !editedMeanwhile) this.rememberLocal(nowFile, entry);
+				this.index.setFile(currentRel, entry);
 				await this.index.flush();
-				if (editedMeanwhile) this.queue.schedule(rel);
+				if (editedMeanwhile) this.queue.schedule(currentRel);
 				ok = true;
 				return true;
 			} catch (e) {
@@ -829,7 +1009,7 @@ export class SyncEngine {
 				ok = false;
 				return false;
 			} finally {
-				this.status.uploadFinished(file.name, ok);
+				this.status.uploadFinished(transfer, ok);
 			}
 		});
 	}
@@ -843,40 +1023,59 @@ export class SyncEngine {
 		file: TFile,
 		entry: IndexEntry,
 		localData: ArrayBuffer,
-		remote: DriveItemMeta
+		remote: DriveItemMeta,
+		revision: number
 	): Promise<void> {
-		const dot = file.name.lastIndexOf(".");
-		const stem = dot > 0 ? file.name.slice(0, dot) : file.name;
-		const ext = dot > 0 ? file.name.slice(dot) : "";
-		const conflictName = `${stem} (conflict ${conflictStamp()})${ext}`;
-		const parentRel = parentOf(rel);
-		const parentId = await this.ensureRemoteFolder(parentRel);
-
-		const uploaded = await this.drive.upload({
-			name: conflictName,
-			parentId,
-			mimeType: mimeFor(file.extension),
-			data: localData,
-		});
-		const conflictRel = joinPath(parentRel, conflictName);
-		await this.ops.createWithContent(this.toVault(conflictRel), localData);
-		this.index.setFile(conflictRel, {
-			fileId: uploaded.id,
-			remoteMd5: uploaded.md5Checksum ?? null,
-			remoteModifiedTime: ts(uploaded.modifiedTime),
-			remoteSize: num(uploaded.size),
-			hydrated: true,
-			dirty: false,
-			lastAccess: Date.now(),
-			hydratedMd5: uploaded.md5Checksum,
-		});
+		if (!entry.conflictCopy || entry.conflictCopy.revision !== revision) {
+			const dot = file.name.lastIndexOf('.');
+			const stem = dot > 0 ? file.name.slice(0, dot) : file.name;
+			const ext = dot > 0 ? file.name.slice(dot) : '';
+			const creationId = await this.drive.generateId();
+			const name = stem + ' (conflict ' + conflictStamp() + '-' + Date.now() + ')' + ext;
+			entry.conflictCopy = { rel: joinPath(parentOf(rel), name), creationId, revision };
+			this.index.markDirty();
+			await this.index.flush();
+		}
+		const copy = entry.conflictCopy;
+		const conflictName = baseName(copy.rel);
+		let localCopy = this.ops.getFile(this.toVault(copy.rel));
+		if (!localCopy) localCopy = await this.ops.createWithContent(this.toVault(copy.rel), localData);
+		let copyEntry = this.index.getFile(copy.rel);
+		if (!copyEntry) {
+			copyEntry = {
+				fileId: '', creationId: copy.creationId, hydrated: true, dirty: true,
+				remoteMd5: null, remoteSize: 0, remoteModifiedTime: 0, lastAccess: Date.now(), revision: 1
+			};
+			this.rememberLocal(localCopy, copyEntry);
+			this.index.setFile(copy.rel, copyEntry);
+			await this.index.flush();
+		}
+		if (!copyEntry.fileId) {
+			const stamp = localCopy.stat.mtime;
+			const parentId = await this.ensureRemoteFolder(parentOf(copy.rel));
+			const uploaded = await this.drive.upload({
+				creationId: copy.creationId, name: conflictName,
+				parentId, mimeType: mimeFor(file.extension), data: localData
+			});
+			copyEntry.fileId = uploaded.id;
+			copyEntry.remoteMd5 = uploaded.md5Checksum ?? null;
+			copyEntry.hydratedMd5 = uploaded.md5Checksum;
+			copyEntry.remoteSize = num(uploaded.size);
+			copyEntry.dirty = localCopy.stat.mtime !== stamp;
+			this.index.setFile(copy.rel, copyEntry);
+			await this.index.flush();
+		}
 
 		// 元ファイルはリモート版で上書き
 		entry.remoteMd5 = remote.md5Checksum ?? null;
 		entry.remoteModifiedTime = ts(remote.modifiedTime);
 		entry.remoteSize = num(remote.size);
-		entry.dirty = false;
-		await this.downloadInto(file, entry);
+		if ((entry.revision ?? 0) === revision) {
+			entry.dirty = false;
+			if (!await this.downloadInto(file, entry)) entry.dirty = true;
+		}
+		this.index.markDirty();
+		await this.index.flush();
 		new Notice(t.conflictDetected(conflictName, file.name));
 	}
 
@@ -885,11 +1084,28 @@ export class SyncEngine {
 	/** ベース相対フォルダパス → Drive folderId（必要なら作成） */
 	async ensureRemoteFolder(rel: string): Promise<string> {
 		if (rel === "") return this.plugin.settings.rootFolderId;
+		const running = this.folderTasks.get(rel);
+		if (running) return running;
+		const task = this.createRemoteFolder(rel);
+		this.folderTasks.set(rel, task);
+		try { return await task; } finally { this.folderTasks.delete(rel); }
+	}
+
+	private async createRemoteFolder(rel: string): Promise<string> {
+		this.assertTarget();
+		if (this.isExcluded(rel)) throw new Error(t.targetChanged);
 		const existing = this.index.getFolderId(rel);
 		if (existing) return existing;
 		const parentId = await this.ensureRemoteFolder(parentOf(rel));
-		const id = await this.drive.createFolder(baseName(rel), parentId);
+		const ids = this.index.data.folderCreationIds ?? (this.index.data.folderCreationIds = {});
+		if (!ids[rel]) {
+			ids[rel] = await this.drive.generateId();
+			this.index.markDirty();
+			await this.index.flush();
+		}
+		const id = await this.drive.createFolder(baseName(rel), parentId, ids[rel]);
 		this.index.setFolder(rel, id);
+		await this.index.flush();
 		this.status.opFlushed();
 		return id;
 	}
@@ -904,7 +1120,7 @@ export class SyncEngine {
 			try {
 				await this.ensureRemoteFolder(rel);
 			} catch (e) {
-				break; // オフライン等 → 後で再試行
+				throw e;
 			}
 		}
 	}
@@ -912,8 +1128,15 @@ export class SyncEngine {
 	// ---------------- 保留中の構造変更 ----------------
 
 	async flushPendingOps(): Promise<void> {
-		if (this.flushingOps) return;
-		this.flushingOps = true;
+		if (this.opsTask) return this.opsTask;
+		const task = this.performPendingOps();
+		this.opsTask = task;
+		try { await task; } finally { this.opsTask = null; }
+	}
+	private async performPendingOps(): Promise<void> {
+		this.assertTarget();
+		await this.index.flush();
+		await Promise.all(Array.from(this.locks.values()));
 		try {
 			while (this.index.data.pendingOps.length > 0) {
 				const op = this.index.data.pendingOps[0];
@@ -942,11 +1165,10 @@ export class SyncEngine {
 						this.status.opFlushed();
 						continue;
 					}
-					break; // オフライン等 → 残して後で再試行
+					throw e;
 				}
 			}
 		} finally {
-			this.flushingOps = false;
 			await this.index.flush();
 		}
 	}
@@ -962,40 +1184,52 @@ export class SyncEngine {
 		} catch (e) {
 			if (e instanceof ApiError && [400, 404, 410].includes(e.status)) {
 				new Notice(t.changeTokenExpired);
-				await this.fullScan();
+				await this.fullScan(true);
 				return;
 			}
 			throw e;
 		}
-		// フォルダ作成を先に適用（子→親の順序ずれ対策）
-		const folderAdds = result.changes.filter(
-			(c) => !c.removed && c.file && !c.file.trashed && c.file.mimeType === FOLDER_MIME
-		);
-		const rest = result.changes.filter((c) => !folderAdds.includes(c));
-		for (const c of [...folderAdds, ...rest]) {
+		const latest = new Map<string, DriveChange>();
+		for (const c of [...(this.index.data.incoming ?? []), ...result.changes]) latest.set(c.fileId, c);
+		this.index.data.incoming = Array.from(latest.values());
+		this.index.data.changesPageToken = result.newStartPageToken;
+		this.index.markDirty();
+		await this.index.flush(); // Durable receipt BEFORE advancing through application.
+		const changes = [...this.index.data.incoming].sort((a, b) =>
+			Number(b.file?.mimeType === FOLDER_MIME) - Number(a.file?.mimeType === FOLDER_MIME));
+		for (const c of changes) {
 			try {
 				await this.applyChange(c);
-			} catch (e) {
-				console.error("gdsync: failed to apply change", c.fileId, e);
-			}
+				this.index.data.incoming = this.index.data.incoming!.filter((item) => item !== c);
+			} catch (e) { console.error('gdsync: incoming change retained', c.fileId, e); }
 		}
-		this.index.data.changesPageToken = result.newStartPageToken;
 		this.index.markDirty();
 		await this.index.flush();
 	}
 
 	/** 親フォルダID → ベース相対パス（ツリー外なら undefined） */
-	private parentPathOf(meta: DriveItemMeta): string | undefined {
+	private async parentPathOf(meta: DriveItemMeta, visited = new Set<string>()): Promise<string | undefined> {
 		const pid = meta.parents?.[0];
 		if (!pid) return undefined;
-		if (pid === this.plugin.settings.rootFolderId) return "";
-		const path = this.index.pathById(pid);
-		if (path === undefined) return undefined;
-		// フォルダIDであることを確認
-		return this.index.getFolderId(path) !== undefined ? path : undefined;
+		if (pid === this.plugin.settings.rootFolderId) return '';
+		const known = this.index.pathById(pid);
+		if (known !== undefined && this.index.getFolderId(known) !== undefined) return known;
+		if (visited.has(pid)) throw new Error('Cyclic Drive ancestry');
+		visited.add(pid);
+		const parent = await this.drive.getMeta(pid);
+		const ancestor = await this.parentPathOf(parent, visited);
+		if (ancestor === undefined) return undefined;
+		const rel = joinPath(ancestor, sanitizeName(parent.name));
+		if (this.isExcluded(rel)) throw new Error('Excluded ancestor');
+		const occupied = this.index.getFolderId(rel);
+		if (occupied && occupied !== pid) throw new Error('Folder path collision: ' + rel);
+		await this.ops.ensureFolder(this.toVault(rel));
+		this.index.setFolder(rel, pid);
+		return rel;
 	}
 
 	private async applyChange(c: DriveChange): Promise<void> {
+		if (this.index.data.pendingOps.some((op) => op.fileId === c.fileId)) throw new Error("Local structure change is pending");
 		const knownPath = this.index.pathById(c.fileId);
 		const meta = c.file;
 
@@ -1015,7 +1249,7 @@ export class SyncEngine {
 		if (!meta) return;
 
 		if (meta.mimeType === FOLDER_MIME) {
-			const parentPath = this.parentPathOf(meta);
+			const parentPath = await this.parentPathOf(meta);
 			if (knownPath !== undefined) {
 				if (parentPath === undefined) {
 					// 対象ツリー外へ移動された
@@ -1043,7 +1277,7 @@ export class SyncEngine {
 
 		// 通常ファイル
 		if (meta.mimeType.startsWith(GOOGLE_APPS_PREFIX) || meta.shortcutDetails) return;
-		const parentPath = this.parentPathOf(meta);
+		const parentPath = await this.parentPathOf(meta);
 
 		if (knownPath !== undefined) {
 			const entry = this.index.getFile(knownPath);
@@ -1080,16 +1314,10 @@ export class SyncEngine {
 				changed = true;
 				await this.withLock(rel, async () => {
 					const f = this.ops.getFile(this.toVault(rel));
-					if (!f) return;
+					if (!f || entry.dirty) return;
 					if (this.isFileOpen(rel) || this.isEager(rel)) {
 						// 開いているファイル・eager 指定は即時更新して実体を保つ
-						await this.downloadInto(f, entry);
-					} else {
-						// 未オープンはスタブ化（次回オープン時に取得）
-						await this.ops.truncateToStub(f);
-						entry.hydrated = false;
-						entry.hydratedMd5 = undefined;
-						this.index.markDirty();
+						if (!await this.downloadInto(f, entry)) throw new Error(`Download deferred: ${rel}`);
 					}
 				});
 			}
@@ -1098,7 +1326,8 @@ export class SyncEngine {
 			if (parentPath === undefined) return;
 			const rel = joinPath(parentPath, sanitizeName(meta.name));
 			if (this.isExcluded(rel)) return;
-			if (this.index.getFile(rel)) return; // パス衝突 → 次回フルスキャンで解決
+			if (this.index.getFile(rel)) throw new Error('File path collision: ' + rel);
+			if (this.ops.exists(this.toVault(rel))) throw new Error('Untracked local file: ' + rel);
 			await this.ops.createStub(this.toVault(rel));
 			this.index.setFile(rel, {
 				fileId: meta.id,
@@ -1124,6 +1353,7 @@ export class SyncEngine {
 		if (entry.dirty) {
 			// ローカル編集を保護: 次回アップロードで新規作成される
 			entry.fileId = "";
+			entry.creationId = undefined;
 			this.index.setFile(rel, entry);
 			return;
 		}
@@ -1140,6 +1370,7 @@ export class SyncEngine {
 			const e = this.index.getFile(f)!;
 			if (e.dirty) {
 				e.fileId = "";
+				e.creationId = undefined;
 				this.index.setFile(f, e);
 				keptFiles.push(f);
 			} else {
@@ -1162,71 +1393,74 @@ export class SyncEngine {
 			else this.index.deleteFolder(fo);
 		}
 		if (keptFiles.length === 0) {
-			const folder = this.ops.getFolder(this.toVault(rel));
-			if (folder) await this.ops.deleteLocal(folder);
+			for (const path of folders.sort((a, b) => b.length - a.length)) {
+				const folder = this.ops.getFolder(this.toVault(path));
+				if (folder && folder.children.length === 0) await this.ops.deleteLocal(folder);
+			}
 		}
 	}
 
 	// ---------------- 同期・キャッシュ管理 ----------------
 
 	/**
-	 * 同期を実行する。自動（起動時/復帰時）はアップロードを投げっぱなしで素早く返し、
-	 * 手動（awaitUploads=true）はアップロード完了まで待って集計し、完了サマリーを通知する。
+	 * Each cycle attempts its current work once; failed retries continue in the queue.
+	 * Automatic cycles stay quiet; manual cycles show the same pending/success result.
 	 */
 	async syncNow(opts?: { awaitUploads?: boolean; notify?: boolean }): Promise<void> {
-		const awaitUploads = opts?.awaitUploads ?? false;
-		const notify = opts?.notify ?? false;
-		if (this.scanning) {
-			if (notify) new Notice(t.scanAlreadyRunning);
+		if (this.scanning || this.syncing || this.migrating || this.migrationRunning) {
+			if (opts?.notify) new Notice(t.syncAlreadyRunning);
 			return;
 		}
-		if (this.syncing) {
-			if (notify) new Notice(t.syncAlreadyRunning);
-			return;
-		}
-		if (awaitUploads) {
-			// 手動同期: 完了まで待って集計し、要約を通知する
-			this.syncing = true;
-			this.status.beginSync();
-			try {
-				await this.flushPendingOps();
-				await this.tryEnsureRemoteFolders();
-				for (const rel of this.index.dirtyPaths()) this.queue.schedule(rel, true);
-				await this.queue.drainPending();
-				await this.pullChanges();
-				const summary = this.status.endSync();
-				if (notify) {
-					if (summary) new Notice(`GDSync: ${summary}`, 6000);
-					else new Notice(`GDSync: ${t.syncNoChanges}`, 3000);
-				}
-			} catch (e) {
-				this.status.endSync();
-				if (!(e instanceof NetworkError)) this.notifyError(t.syncFailed, e);
-			} finally {
-				this.syncing = false;
-			}
-			return;
-		}
-		// 自動同期: 通知なし。アップロードはバックグラウンドのキューが継続する
 		this.syncing = true;
+		this.pendingIssues.clear();
+		this.status.beginSync();
+		let failed = false;
 		try {
+			this.assertTarget();
+			await this.queue.pause();
+			await Promise.all(Array.from(this.locks.values()));
+			if (this.opsTask) await this.opsTask;
+			if (!this.index.data.changesPageToken) await this.fullScan(true);
+			if (!this.index.data.changesPageToken) throw new Error(t.syncNotReady);
+			await this.reconcileLocal();
 			await this.flushPendingOps();
 			await this.tryEnsureRemoteFolders();
-			for (const rel of this.index.dirtyPaths()) this.queue.schedule(rel, true);
 			await this.pullChanges();
+			this.openAttachments.clear();
+			const openNotes: TFile[] = [];
+			this.plugin.app.workspace.iterateAllLeaves((leaf) => {
+				if (leaf.view instanceof FileView && leaf.view.file?.extension === "md") openNotes.push(leaf.view.file);
+			});
+			for (const file of openNotes) await this.hydrateEmbedsOf(file);
+			this.queue.resume();
+			// Attachments first. A second phase reads current notes only after that attempt.
+			await this.queue.runNow(this.index.dirtyPaths().filter((rel) => !rel.endsWith(".md")));
+			await this.queue.runNow(this.index.dirtyPaths().filter((rel) => rel.endsWith(".md")));
+			await this.flushPendingOps();
+			await this.index.flush();
 		} catch (e) {
-			if (!(e instanceof NetworkError)) this.notifyError(t.syncFailed, e);
+			failed = true;
+			if (e instanceof NetworkError) this.status.setOffline();
+			else this.notifyError(t.syncFailed, e);
 		} finally {
+			this.queue.resume();
+			const pending = this.index.dirtyPaths().length;
+			const ops = this.index.data.pendingOps.length + Object.values(this.index.data.folders).filter(id => !id).length;
+			const incoming = this.index.data.incoming?.length ?? 0;
+			const summary = this.status.endSync({ pending, ops, incoming, failed: failed || this.pendingIssues.size > 0 });
 			this.syncing = false;
+			if (opts?.notify) new Notice('GDSync: ' + (summary ?? t.syncNoChanges), 6000);
 		}
 	}
 
 	/** 古い/多すぎるキャッシュを脱ハイドレート */
 	async evictCache(): Promise<void> {
+		if (this.migrating || this.scanning || this.syncing) return;
 		const s = this.plugin.settings;
 		const now = Date.now();
 		const candidates: Array<{ rel: string; entry: IndexEntry }> = [];
 		for (const [rel, entry] of Object.entries(this.index.data.files)) {
+			if (this.openAttachments.has(rel)) continue;
 			if (!entry.hydrated || entry.dirty || !entry.fileId) continue;
 			if (this.queue.has(rel)) continue;
 			// アップロード済みでリモートと一致しているものだけ安全に破棄できる
@@ -1252,7 +1486,9 @@ export class SyncEngine {
 				if (!entry.hydrated || entry.dirty) return;
 				const f = this.ops.getFile(this.toVault(rel));
 				if (!f) return;
-				await this.ops.truncateToStub(f);
+				const revision = entry.revision ?? 0;
+				if (!await this.ops.truncateToStub(f, () => !entry.dirty && (entry.revision ?? 0) === revision)) return;
+				this.rememberLocal(f, entry);
 				entry.hydrated = false;
 				entry.hydratedMd5 = undefined;
 				this.index.markDirty();

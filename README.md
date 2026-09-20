@@ -4,7 +4,7 @@
 
 GDSync lets Obsidian on mobile (iOS/Android) read and write a vault stored in Google Drive **on demand**, without downloading the whole vault first.
 
-- Mirrors the folder/file structure of a Drive folder into your vault (default `GDrive/`) as **zero-byte stub files** — Obsidian's file explorer and quick switcher work as usual
+- Mirrors the folder/file structure of a Drive folder into your vault (vault root for new installations; `GDrive/` subfolder mode remains available) as **zero-byte stub files** — Obsidian's file explorer and quick switcher work as usual
 - Downloads a file's content **when you open it** (hydration)
 - **Uploads edits automatically** (debounced a few seconds; conflicts are detected via checksums and preserved as `(conflict …)` copies)
 - Files you have opened stay cached locally; old cache entries are automatically released back to stubs
@@ -71,12 +71,12 @@ Copy the generated `main.js`, `manifest.json`, and `styles.css` into `<vault>/.o
 1. On the connected desktop, settings → *Connection code* → *Copy code*
 2. Send the code to your phone, paste it via *Enter code* in the plugin settings, then delete the message you used to transfer it — the code is equivalent to a password
 
-The code also carries the shared settings — the Drive folder, mirror base folder, exclude and always-sync patterns, maximum file size, upload debounce, and freshness interval — so a new device needs no re-entry. Device-specific settings (cache retention/count, *Enable on desktop*) are deliberately left alone, and nothing is applied unless you paste a code on that device.
+The code also carries the shared settings — the Drive folder (if no target is set), exclude and always-sync patterns, maximum file size, upload debounce, and freshness interval — so a new device needs no re-entry. Device-specific settings (mount mode/base folder, cache retention/count, *Enable on desktop*) are deliberately left alone, and nothing is applied unless you paste a code on that device.
 
 **Then, on the device that will sync (typically the phone):**
 
 1. *Choose from list* to pick the Drive folder to sync (pasting a Drive URL also works)
-2. *Run full scan* → the stub tree is created under `GDrive/`
+2. *Run full scan* → the stub tree is created at the vault root (or under `GDrive/` in subfolder mode)
 
 The plugin UI is available in **English and Japanese**, following Obsidian's display-language setting.
 
@@ -89,7 +89,23 @@ The plugin UI is available in **English and Japanese**, following Obsidian's dis
 
 ## Safety design
 
-- **Multiple guards against overwriting Drive with empty stubs** (edits to not-yet-downloaded files are never uploaded, with a warning)
+### Consistent paths across devices
+
+New installations use **Vault root** mode in a dedicated vault. Existing installations keep their subfolder layout. Point the Drive target at the desktop vault root so `Notes/note.md` and `Attachments/image.png` have the same vault-relative paths everywhere.
+
+To convert an existing mirror, first sync pending structure changes and incoming changes. Stop editing on other devices, then use **Migrate to vault root / resume migration** in settings. All non-excluded files in the vault, including files outside the old mirror, become sync targets. Do not enable GDSync on the same local folder managed by Google Drive for Desktop.
+
+Migration backs up local contents under `<config>/plugins/gdsync/migration-backup/`, repairs resolved Markdown body links and Canvas file nodes, and refuses destination collisions. Unresolved links and frontmatter links are reported; plugin-specific formats and links inside Canvas text nodes are not rewritten. Markdown and Canvas stubs must be downloaded before migration. Interrupted migrations pause ordinary sync and can be resumed from the same button. Edits detected during migration are preserved and stop the operation for review.
+
+Use **Check attachment links** to find missing, out-of-scope, or unsent attachments; notes whose content has not been downloaded are reported as unchecked. New attachments are sent before referring notes. Local edits made during network requests remain pending.
+
+Live activity and manual completion summaries remain available. Completion refers to this device and Drive, not delivery to every other device. Unsent files, structure operations and unapplied incoming changes produce a pending summary instead of success. Failed incoming changes are persisted for retry; reserved Drive IDs prevent duplicate creation after a lost response. Checkpoints preserve the sync index across interrupted writes.
+
+Connection codes no longer replace an existing target or local mount layout. Resetting the index resets the change cursor while retaining stub identities and content baselines.
+
+Run `npm test` for mocked Vault/Drive regression tests and `npm run build` for type checking and the production bundle. Real-device integration still requires validation in Obsidian and Google Drive for Desktop.
+
+- **Multiple guards against overwriting Drive with empty stubs**; edits to not-yet-downloaded files are warned about and preserved as conflict copies.
 - Deletions always go to the Drive **trash** (nothing is permanently deleted); local deletions follow your Obsidian trash preference
 - On conflict both versions are kept (the local one as `name (conflict <timestamp>).md`)
 - Offline edits are preserved and sent automatically when back online

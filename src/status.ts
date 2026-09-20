@@ -15,6 +15,7 @@ export interface SyncSnapshot {
 	remoteRemoved: number;
 	opsFlushed: number;
 	lastSyncAt: number;
+	lastSuccessAt?: number;
 	lastSummary: string | null;
 }
 
@@ -41,8 +42,11 @@ export class StatusDisplay {
 		lastSummary: null,
 	};
 	/** アップロード実行中のファイル名（並列アップロード対応） */
-	private uploading = new Set<string>();
-	private activeDownload: string | null = null;
+	private uploading = new Map<string, string>();
+	private downloading = new Map<string, string>();
+	private nextTransfer = 0;
+	private pendingText: string | null = null;
+	private get activeDownload(): string | null { return this.downloading.values().next().value ?? null; }
 	/** beginSync()〜endSync() の間に集計する（自動同期は集計しない） */
 	private cycleRunning = false;
 	private offline = false;
@@ -58,7 +62,7 @@ export class StatusDisplay {
 
 	getSnapshot(): SyncSnapshot {
 		this.snap.currentFile =
-			this.activeDownload ?? (this.uploading.size > 0 ? this.first(this.uploading) : null);
+			this.activeDownload ?? (this.uploading.size > 0 ? this.uploading.values().next().value! : null);
 		this.snap.phase =
 			this.uploading.size > 0
 				? "uploading"
@@ -74,8 +78,8 @@ export class StatusDisplay {
 
 	beginSync(): void {
 		this.offline = false;
-		this.uploading.clear();
-		this.activeDownload = null;
+		this.pendingText = null;
+
 		this.cycleRunning = true;
 		this.snap = {
 			phase: "syncing",
@@ -88,16 +92,16 @@ export class StatusDisplay {
 			remoteRemoved: 0,
 			opsFlushed: 0,
 			lastSyncAt: this.snap.lastSyncAt,
+			lastSuccessAt: this.snap.lastSuccessAt,
 			lastSummary: this.snap.lastSummary,
 		};
 		this.render();
 	}
 
 	/** サイクル終了。人間可読の要約（1件もなければ null）を返す。戻り値は呼び出し側で Notice に使う */
-	endSync(): string | null {
+	endSync(result?: { pending: number; ops: number; incoming: number; failed: boolean }): string | null {
 		this.cycleRunning = false;
-		this.uploading.clear();
-		this.activeDownload = null;
+
 		this.snap.lastSyncAt = Date.now();
 		this.snap.currentFile = null;
 		this.snap.phase = "idle";
@@ -111,21 +115,28 @@ export class StatusDisplay {
 			parts.push(t.syncClientRemote(s.remoteAdded, s.remoteUpdated, s.remoteRemoved));
 		}
 		if (s.opsFlushed) parts.push(t.syncClientOps(s.opsFlushed));
-		const summary = parts.length > 0 ? t.syncFinished(parts.join(" / ")) : null;
+		const complete = !result || !(result.pending || result.ops || result.incoming || result.failed);
+		if (complete) this.snap.lastSuccessAt = Date.now();
+		const summary = !complete && result
+			? ((result.pending || result.ops || result.incoming) ? t.syncPending(result.pending, result.ops, result.incoming) : t.syncIncomplete)
+			: parts.length > 0 ? t.syncFinished(parts.join(" / ")) : null;
 		this.snap.lastSummary = summary ? `GDSync: ${summary}` : null;
+		this.pendingText = complete ? null : summary;
 		this.render();
 		return summary;
 	}
 
 	// ---- 活動報告（表示と集計を兼ねる） ----
 
-	uploadStarting(fileName: string): void {
-		this.uploading.add(fileName);
+	uploadStarting(fileName: string): string {
+		const id = String(++this.nextTransfer);
+		this.uploading.set(id, fileName);
 		this.render();
+		return id;
 	}
 
-	uploadFinished(fileName: string, ok: boolean): void {
-		this.uploading.delete(fileName);
+	uploadFinished(id: string, ok: boolean): void {
+		this.uploading.delete(id);
 		if (ok) this.offline = false;
 		if (this.cycleRunning) {
 			if (ok) this.snap.uploaded++;
@@ -134,13 +145,15 @@ export class StatusDisplay {
 		this.render();
 	}
 
-	downloadStarting(fileName: string): void {
-		this.activeDownload = fileName;
+	downloadStarting(fileName: string): string {
+		const id = String(++this.nextTransfer);
+		this.downloading.set(id, fileName);
 		this.render();
+		return id;
 	}
 
-	downloadFinished(ok: boolean): void {
-		this.activeDownload = null;
+	downloadFinished(id: string, ok: boolean): void {
+		this.downloading.delete(id);
 		if (ok) this.offline = false;
 		if (this.cycleRunning && ok) this.snap.downloaded++;
 		this.render();
@@ -193,16 +206,12 @@ export class StatusDisplay {
 
 	// ---- 表示合成 ----
 
-	private first(set: Set<string>): string {
-		return set.values().next().value as string;
-	}
-
 	private render(): void {
 		if (this.uploading.size > 0) {
 			if (this.uploading.size === 1) {
-				this.set(t.uploadingStatus(this.first(this.uploading)));
+				this.set(t.uploadingStatus(this.uploading.values().next().value!));
 			} else {
-				this.set(t.uploadingStatusN(this.uploading.size, this.first(this.uploading)));
+				this.set(t.uploadingStatusN(this.uploading.size, this.uploading.values().next().value!));
 			}
 			return;
 		}
@@ -214,6 +223,6 @@ export class StatusDisplay {
 			this.set(t.syncing);
 			return;
 		}
-		this.set(this.offline ? t.offlineUploadPending : "");
+		this.set(this.pendingText ?? (this.offline ? t.offlineUploadPending : ""));
 	}
 }

@@ -1,4 +1,5 @@
-import { normalizePath } from "obsidian";
+import { normalizePath, Notice } from "obsidian";
+import { t } from "./i18n";
 import type GdsyncPlugin from "./main";
 import { emptyIndex, GdsyncIndex, IndexEntry } from "./types";
 
@@ -14,8 +15,10 @@ export class FileIndex {
 	private byId = new Map<string, string>();
 	private saveTimer: number | null = null;
 	private pendingSave = false;
+	private saving: Promise<void> = Promise.resolve();
+	ready = false;
 
-	constructor(private plugin: GdsyncPlugin) {}
+	constructor(private plugin: GdsyncPlugin) { }
 
 	private get filePath(): string {
 		return normalizePath(`${this.plugin.manifest.dir}/index.json`);
@@ -23,19 +26,37 @@ export class FileIndex {
 
 	async load(): Promise<void> {
 		const adapter = this.plugin.app.vault.adapter;
+		const parse = (raw: string): GdsyncIndex => {
+			const parsed = JSON.parse(raw) as GdsyncIndex;
+			if (!parsed || parsed.version !== 1 || !parsed.files || !parsed.folders || !Array.isArray(parsed.pendingOps)) throw new Error("Invalid index");
+			return parsed;
+		};
 		try {
 			if (await adapter.exists(this.filePath)) {
 				const raw = await adapter.read(this.filePath);
-				const parsed = JSON.parse(raw) as GdsyncIndex;
-				if (parsed && parsed.version === 1) {
-					this.data = parsed;
-				}
+				this.data = parse(raw);
+			} else if (await adapter.exists(this.filePath + ".tmp") || await adapter.exists(this.filePath + ".bak")) {
+				throw new Error("Missing checkpoint");
 			}
 		} catch (e) {
-			console.error("gdsync: failed to load index.json; a full rescan is required", e);
-			this.data = emptyIndex();
+			let restored = false;
+			for (const suffix of [".tmp", ".bak"]) {
+				try {
+					if (!await adapter.exists(this.filePath + suffix)) continue;
+					const raw = await adapter.read(this.filePath + suffix);
+					const parsed = parse(raw);
+					if (await adapter.exists(this.filePath)) await adapter.write(this.filePath + ".corrupt", await adapter.read(this.filePath));
+					await adapter.write(this.filePath, raw);
+					this.data = parsed;
+					restored = true;
+					new Notice(t.indexRecovered, 15000);
+					break;
+				} catch (recoveryError) { console.error("gdsync: checkpoint recovery failed", suffix, recoveryError); }
+			}
+			if (!restored) throw new Error(t.indexRecoveryFailed);
 		}
 		this.rebuildReverseMap();
+		this.ready = true;
 	}
 
 	private rebuildReverseMap(): void {
@@ -54,27 +75,33 @@ export class FileIndex {
 		if (this.saveTimer !== null) window.clearTimeout(this.saveTimer);
 		this.saveTimer = window.setTimeout(() => {
 			this.saveTimer = null;
-			void this.flush();
+			void this.flush().catch((e) => console.error("gdsync: index save failed", e));
 		}, SAVE_DEBOUNCE_MS);
 	}
 
 	/** 即時保存（アップロード成功などの重要遷移後・unload時） */
 	async flush(): Promise<void> {
-		if (!this.pendingSave) return;
+		if (!this.pendingSave) return this.saving;
 		this.pendingSave = false;
 		if (this.saveTimer !== null) {
 			window.clearTimeout(this.saveTimer);
 			this.saveTimer = null;
 		}
-		try {
-			await this.plugin.app.vault.adapter.write(
-				this.filePath,
-				JSON.stringify(this.data)
-			);
-		} catch (e) {
-			console.error("gdsync: failed to save index.json", e);
-			this.pendingSave = true;
-		}
+		const snapshot = JSON.stringify(this.data);
+		const write = this.saving.catch(() => undefined).then(async () => {
+			const adapter = this.plugin.app.vault.adapter;
+			// The old checkpoint survives a failed or interrupted replacement.
+			if (await adapter.exists(this.filePath)) {
+				const previous = await adapter.read(this.filePath);
+				JSON.parse(previous);
+				await adapter.write(this.filePath + ".bak", previous);
+			}
+			await adapter.write(this.filePath + ".tmp", snapshot);
+			await adapter.write(this.filePath, snapshot);
+		});
+		this.saving = write;
+		try { await write; }
+		catch (e) { this.pendingSave = true; throw e; }
 	}
 
 	// ---- ファイルエントリ操作（逆引きを常に同期させる） ----
@@ -125,6 +152,7 @@ export class FileIndex {
 		const old = this.data.folders[path];
 		if (old) this.byId.delete(old);
 		delete this.data.folders[path];
+		if (this.data.folderCreationIds) delete this.data.folderCreationIds[path];
 		this.markDirty();
 	}
 
@@ -143,6 +171,17 @@ export class FileIndex {
 	/** フォルダリネーム: 配下エントリのキーを一括付け替え */
 	renameFolderPrefix(oldPath: string, newPath: string): void {
 		const prefix = oldPath + "/";
+		for (const op of this.data.pendingOps) {
+			if (op.kind === "renameRemote" && (op.newParentPath === oldPath || op.newParentPath.startsWith(prefix))) {
+				op.newParentPath = newPath + op.newParentPath.slice(oldPath.length);
+			}
+		}
+		for (const [path, id] of Object.entries(this.data.folderCreationIds ?? {})) {
+			if (path === oldPath || path.startsWith(prefix)) {
+				delete this.data.folderCreationIds![path];
+				this.data.folderCreationIds![newPath + path.slice(oldPath.length)] = id;
+			}
+		}
 		const remapped: Array<[string, string]> = [];
 		for (const p of Object.keys(this.data.files)) {
 			if (p.startsWith(prefix)) remapped.push([p, newPath + "/" + p.slice(prefix.length)]);

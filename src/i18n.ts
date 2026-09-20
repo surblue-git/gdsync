@@ -38,6 +38,33 @@ function detectLang(): "ja" | "en" {
 }
 
 const en = {
+	indexRecovered: "GDSync: Recovered the sync index from a saved checkpoint. Local files will be reconciled before syncing.",
+	indexRecoveryFailed: "GDSync: The sync index could not be recovered. Sync is stopped to protect local files.",
+
+	migrationResume: "GDSync: An unfinished migration was found. Sync is paused; resume migration in settings.",
+	migrationPendingOps: "Sync pending structure changes and incoming changes before migrating.",
+	uncheckedStub: "Not checked (content not downloaded)",
+	linkMissing: "Target not found",
+	linkOutside: "Outside sync scope",
+	linkPending: "Upload pending",
+	linksHealthy: "No attachment issues found in downloaded notes.",
+	migrateConfirm: "Migrate local files to vault root",
+	migrateConfirmDesc: "All non-excluded files in this vault will become sync targets, including files outside the old mirror. Use a dedicated vault. Local content is backed up in the plugin folder. Unresolved links are reported after migration. Close other editing sessions first.",
+
+	syncNotReady: "GDSync: Sync is inactive, not initialized, or migration is in progress.",
+	targetChanged: "GDSync: The sync target changed. Restore the previous target or use migration.",
+	syncPending: (n: number, ops: number, incoming: number) => `Drive sync pending: ${n} file(s), ${ops} structure operation(s), ${incoming} incoming change(s).`,
+	syncIncomplete: "Drive sync incomplete. Check pending changes and errors.",
+	mountMode: "Sync location",
+	mountModeDesc: "Vault root gives every device the same paths. Existing mirrors must use migration.",
+	mountRoot: "Vault root (dedicated vault)",
+	mountSubfolder: "Subfolder (existing layout)",
+	migrateRoot: "Migrate to vault root / resume migration",
+	migrateDesc: "Checks collisions, backs up local contents, and repairs resolved Markdown links. Keep other devices closed during migration.",
+	migrationDone: "Local migration finished. Sync to send repaired notes to Drive.",
+	diagnoseLinks: "Check attachment links",
+	targetLocked: "This target already contains indexed files. Use migration or a new dedicated vault.",
+
 	// ---- auth ----
 	setCredsFirst: "GDSync: Set the client ID and client secret first.",
 	mobileNoRedirect:
@@ -116,7 +143,7 @@ const en = {
 	downloading: (name: string) => `Downloading ${name}…`,
 	downloadFailed: (name: string) => `Failed to download ${name}`,
 	stubEditWarning:
-		"GDSync: This file's content has not been downloaded yet, so this edit will not be uploaded. Reopen the file while online first.",
+		"GDSync: This file was edited before its content was downloaded. Your edit is preserved; sync will keep a conflict copy.",
 	emptyUploadCancelled: (name: string) =>
 		`GDSync: Upload of ${name} was cancelled because it is empty while the remote copy has content. If this is intentional, open the remote version once and then edit it.`,
 	offlineUploadPending: "Offline (upload pending)",
@@ -138,7 +165,7 @@ const en = {
 	syncClientRemote: (add: number, upd: number, del: number) =>
 		`remote +${add} / ~${upd} / −${del}`,
 	syncClientOps: (n: number) => `structure ops ${n}`,
-	syncFinished: (parts: string) => `Sync finished (${parts})`,
+	syncFinished: (parts: string) => `Drive sync finished (${parts})`,
 
 	// ---- settings ----
 	modalEnterCodeTitle: "Enter connection code",
@@ -232,12 +259,39 @@ const en = {
 	indexReset: "GDSync: Index has been reset. Run a full scan to rebuild it.",
 	syncNever: "never",
 	syncNoSummary: "No sync has been run yet.",
-	syncStateLabel: (last: string) => `Sync status: last sync ${last}`,
+	syncStateLabel: (last: string) => `Sync status: last attempt ${last}`,
 };
 
 type Strings = typeof en;
 
 const ja: Strings = {
+	indexRecovered: "GDSync: 保存済みの同期記録から復旧しました。ローカルファイルを照合してから同期します。",
+	indexRecoveryFailed: "GDSync: 同期記録を復旧できませんでした。ローカルファイル保護のため同期を停止しています。",
+
+	migrationResume: "GDSync: 未完了の移行があります。同期を停止しています。設定から移行を再開してください。",
+	migrationPendingOps: "保留中の構造変更・受信差分を同期してから移行してください。",
+	uncheckedStub: "未検査（本文未取得）",
+	linkMissing: "参照先が見つかりません",
+	linkOutside: "同期範囲外",
+	linkPending: "送信待ち",
+	linksHealthy: "取得済みノートに添付の問題は見つかりませんでした。",
+	migrateConfirm: "ローカルファイルをVault直下へ移行",
+	migrateConfirmDesc: "旧ミラー外のファイルを含め、除外対象以外のVault内ファイルが同期対象になります。専用Vaultで使用してください。元の内容はプラグインフォルダへ退避します。未解決リンクは移行後に表示します。他の端末やウィンドウでの編集を止めてから実行してください。",
+
+	syncNotReady: "GDSync: 同期が無効・初期化前、または移行中です。",
+	targetChanged: "GDSync: 同期先が変更されています。元の設定に戻すか移行機能を使用してください。",
+	syncPending: (n: number, ops: number, incoming: number) => `Driveとの同期は未完了: 未送信${n}件・構造変更${ops}件・未適用差分${incoming}件。`,
+	syncIncomplete: "Driveとの同期は未完了です。保留中の変更・エラーを確認してください。",
+	mountMode: "同期先の配置",
+	mountModeDesc: "Vault直下にすると各端末のパスが一致します。既存ミラーには移行機能を使用してください。",
+	mountRoot: "Vault直下（専用Vault）",
+	mountSubfolder: "サブフォルダ（従来方式）",
+	migrateRoot: "Vault直下へ移行／移行を再開",
+	migrateDesc: "衝突を検査し、ローカル内容を退避して解決済みMarkdownリンクを修復します。移行中は他端末での編集を止めてください。",
+	migrationDone: "ローカルの移行が完了しました。同期して修復したノートをDriveに送信してください。",
+	diagnoseLinks: "添付リンクを診断",
+	targetLocked: "既に同期対象が登録されています。移行機能または新しい専用Vaultを使用してください。",
+
 	// ---- auth ----
 	setCredsFirst: "GDSync: 先にクライアントIDとクライアントシークレットを設定してください。",
 	mobileNoRedirect:
@@ -316,7 +370,7 @@ const ja: Strings = {
 	downloading: (name: string) => `${name} をダウンロード中…`,
 	downloadFailed: (name: string) => `${name} のダウンロードに失敗`,
 	stubEditWarning:
-		"GDSync: このファイルの内容はまだダウンロードされていないため、この編集はアップロードされません。オンラインで一度ファイルを開き直してください。",
+		"GDSync: 未取得のファイルが編集されました。編集内容を保持し、同期時に競合コピーとして保護します。",
 	emptyUploadCancelled: (name: string) =>
 		`GDSync: ${name} は空でリモート側に内容があるため、アップロードを中止しました。意図的な場合は、一度リモート版を開いてから編集してください。`,
 	offlineUploadPending: "オフライン（アップロード保留中）",
@@ -338,7 +392,7 @@ const ja: Strings = {
 	syncClientRemote: (add: number, upd: number, del: number) =>
 		`差分 追加 ${add} / 更新 ${upd} / 削除 ${del}`,
 	syncClientOps: (n: number) => `構造変更 ${n}件`,
-	syncFinished: (parts: string) => `同期完了（${parts}）`,
+	syncFinished: (parts: string) => `Driveとの同期完了（${parts}）`,
 
 	// ---- settings ----
 	modalEnterCodeTitle: "接続コードを入力",
@@ -432,7 +486,7 @@ const ja: Strings = {
 	indexReset: "GDSync: インデックスをリセットしました。フルスキャンで再構築してください。",
 	syncNever: "なし",
 	syncNoSummary: "まだ同期を実行していません。",
-	syncStateLabel: (last: string) => `同期状態: 最終同期 ${last}`,
+	syncStateLabel: (last: string) => `同期状態: 最終試行 ${last}`,
 };
 
 export const t: Strings = detectLang() === "ja" ? ja : en;

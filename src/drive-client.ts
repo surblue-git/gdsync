@@ -13,7 +13,7 @@ const FILE_FIELDS =
 	"id,name,mimeType,parents,md5Checksum,modifiedTime,size,trashed,shortcutDetails";
 
 /** トランスポートレベルの失敗（オフライン等）。リトライ対象 */
-export class NetworkError extends Error {}
+export class NetworkError extends Error { }
 
 /** HTTP エラー。status で分岐する */
 export class ApiError extends Error {
@@ -25,6 +25,7 @@ export class ApiError extends Error {
 export interface UploadParams {
 	/** 既存ファイルの更新なら指定 (PATCH)、新規なら undefined (POST) */
 	fileId?: string;
+	creationId?: string;
 	name?: string;
 	parentId?: string;
 	mimeType: string;
@@ -55,10 +56,10 @@ function buildMultipartBody(
 	const enc = new TextEncoder();
 	const head = enc.encode(
 		`--${boundary}\r\n` +
-			`Content-Type: application/json; charset=UTF-8\r\n\r\n` +
-			`${JSON.stringify(metadata)}\r\n` +
-			`--${boundary}\r\n` +
-			`Content-Type: ${contentType}\r\n\r\n`
+		`Content-Type: application/json; charset=UTF-8\r\n\r\n` +
+		`${JSON.stringify(metadata)}\r\n` +
+		`--${boundary}\r\n` +
+		`Content-Type: ${contentType}\r\n\r\n`
 	);
 	const tail = enc.encode(`\r\n--${boundary}--`);
 	const body = new Uint8Array(head.byteLength + data.byteLength + tail.byteLength);
@@ -72,7 +73,7 @@ function buildMultipartBody(
 }
 
 export class DriveClient {
-	constructor(private auth: AuthManager) {}
+	constructor(private auth: AuthManager) { }
 
 	/** 認証ヘッダ付与 + 401時1回だけリフレッシュ&リトライ + エラー分類 */
 	private async call(
@@ -169,6 +170,7 @@ export class DriveClient {
 
 	async upload(p: UploadParams): Promise<DriveItemMeta> {
 		const metadata: Record<string, unknown> = {};
+		if (!p.fileId && p.creationId) metadata.id = p.creationId;
 		if (p.name) metadata.name = p.name;
 		if (!p.fileId) {
 			metadata.mimeType = p.mimeType;
@@ -179,27 +181,47 @@ export class DriveClient {
 		const url = p.fileId
 			? `${UPLOAD_API}/files/${p.fileId}?uploadType=multipart&fields=${fields}`
 			: `${UPLOAD_API}/files?uploadType=multipart&fields=${fields}`;
-		const res = await this.call({
-			url,
-			method: p.fileId ? "PATCH" : "POST",
-			contentType,
-			body,
-		});
+		let res: RequestUrlResponse;
+		try {
+			res = await this.call({
+				url,
+				method: p.fileId ? "PATCH" : "POST",
+				contentType,
+				body,
+			});
+		} catch (e) {
+			if (e instanceof ApiError && e.status === 409 && p.creationId && !p.fileId) {
+				// Recover the successful creation; the engine compares the actual bytes before ACK.
+				return { ...await this.getMeta(p.creationId), gdsyncRecovered: true };
+			}
+			throw e;
+		}
 		return res.json as DriveItemMeta;
 	}
 
-	async createFolder(name: string, parentId: string): Promise<string> {
-		const res = await this.call({
-			url: `${API}/files?fields=id`,
-			method: "POST",
-			contentType: "application/json",
-			body: JSON.stringify({
-				name,
-				mimeType: FOLDER_MIME,
-				parents: [parentId],
-			}),
-		});
-		return res.json.id as string;
+	async generateId(): Promise<string> {
+		const res = await this.call({ url: `${API}/files/generateIds?count=1&space=drive&type=files` });
+		return res.json.ids[0];
+	}
+
+	async createFolder(name: string, parentId: string, creationId?: string): Promise<string> {
+		try {
+			const res = await this.call({
+				url: `${API}/files?fields=id`,
+				method: "POST",
+				contentType: "application/json",
+				body: JSON.stringify({
+					id: creationId,
+					name,
+					mimeType: FOLDER_MIME,
+					parents: [parentId],
+				}),
+			});
+			return res.json.id as string;
+		} catch (e) {
+			if (e instanceof ApiError && e.status === 409 && creationId) return creationId;
+			throw e;
+		}
 	}
 
 	/** rename / move / trash 等のメタデータ更新 */
@@ -239,7 +261,7 @@ export class DriveClient {
 		const changes: DriveChange[] = [];
 		let token = pageToken;
 		let newStart = "";
-		for (;;) {
+		for (; ;) {
 			const params = new URLSearchParams({
 				pageToken: token,
 				fields: `nextPageToken,newStartPageToken,changes(fileId,removed,file(${FILE_FIELDS}))`,

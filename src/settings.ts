@@ -11,6 +11,7 @@ import { FOLDER_MIME } from "./drive-client";
 import { t } from "./i18n";
 import type GdsyncPlugin from "./main";
 import { DriveItemMeta } from "./types";
+import { validPath } from "./sync-paths";
 
 interface FolderChoice {
 	id: string;
@@ -92,6 +93,21 @@ class ConnectionCodeModal extends Modal {
 	onClose(): void {
 		this.contentEl.empty();
 	}
+}
+
+class SyncReportModal extends Modal {
+	constructor(app: App, private heading: string, private lines: string[], private action?: () => Promise<void>) { super(app); }
+	onOpen(): void {
+		this.setTitle(this.heading);
+		for (const line of this.lines) this.contentEl.createEl("p", { text: line });
+		if (this.action) new Setting(this.contentEl).addButton((button) =>
+			button.setButtonText(t.btnRun).setCta().onClick(async () => {
+				button.setDisabled(true);
+				try { await this.action!(); this.close(); }
+				catch (e) { new Notice(String(e), 15000); button.setDisabled(false); }
+			}));
+	}
+	onClose(): void { this.contentEl.empty(); }
 }
 
 export class GdsyncSettingTab extends PluginSettingTab {
@@ -221,8 +237,12 @@ export class GdsyncSettingTab extends PluginSettingTab {
 				text.setPlaceholder(t.driveFolderPlaceholder)
 					.setValue(s.rootFolderId)
 					.onChange(async (v) => {
+						if (!this.plugin.engine.canChangeTarget()) { new Notice(t.targetLocked); return; }
 						s.rootFolderId = extractFolderId(v);
 						s.rootFolderName = "";
+						this.plugin.index.reset(s.rootFolderId);
+						this.plugin.index.data.mountBase = this.plugin.engine.basePath();
+						await this.plugin.index.flush();
 						await this.plugin.saveSettings();
 					});
 				// フォーカスが外れたら、手入力IDの実在を検証してフォルダ名を解決する。
@@ -258,8 +278,12 @@ export class GdsyncSettingTab extends PluginSettingTab {
 						const folders = await this.plugin.drive.listAllFolders();
 						const choices = buildFolderChoices(folders);
 						new DriveFolderSuggestModal(this.app, choices, async (c) => {
+							if (!this.plugin.engine.canChangeTarget()) { new Notice(t.targetLocked); return; }
 							s.rootFolderId = c.id;
 							s.rootFolderName = c.path;
+							this.plugin.index.reset(s.rootFolderId);
+							this.plugin.index.data.mountBase = this.plugin.engine.basePath();
+							await this.plugin.index.flush();
 							await this.plugin.saveSettings();
 							this.display();
 						}).open();
@@ -279,10 +303,27 @@ export class GdsyncSettingTab extends PluginSettingTab {
 			.setDesc(t.mirrorBaseDesc)
 			.addText((text) =>
 				text.setValue(s.baseFolder).onChange(async (v) => {
+					if (!this.plugin.engine.canChangeTarget()) { new Notice(t.targetLocked); return; }
+					if (!validPath(v.trim())) return;
 					s.baseFolder = v.trim() || "GDrive";
+					this.plugin.index.data.mountBase = s.mountMode === "vaultRoot" ? "" : s.baseFolder;
+					this.plugin.index.markDirty();
+					await this.plugin.index.flush();
 					await this.plugin.saveSettings();
 				})
 			);
+
+		new Setting(containerEl).setName(t.mountMode).setDesc(t.mountModeDesc)
+			.addDropdown((drop) => drop.addOption("subfolder", t.mountSubfolder)
+				.addOption("vaultRoot", t.mountRoot).setValue(s.mountMode)
+				.onChange(async (value) => {
+					if (!this.plugin.engine.canChangeTarget()) { new Notice(t.targetLocked); drop.setValue(s.mountMode); return; }
+					s.mountMode = value === "vaultRoot" ? "vaultRoot" : "subfolder";
+					this.plugin.index.data.mountBase = this.plugin.engine.basePath();
+					this.plugin.index.markDirty();
+					await this.plugin.index.flush();
+					await this.plugin.saveSettings();
+				}));
 
 		new Setting(containerEl)
 			.setName(t.excludePatterns)
@@ -398,6 +439,19 @@ export class GdsyncSettingTab extends PluginSettingTab {
 
 		// ---------- メンテナンス ----------
 		new Setting(containerEl).setName(t.headingMaintenance).setHeading();
+		new Setting(containerEl).setName(t.diagnoseLinks).addButton((button) =>
+			button.setButtonText(t.btnRun).onClick(async () => {
+				const issues = await this.plugin.engine.diagnoseAttachments();
+				new SyncReportModal(this.app, t.diagnoseLinks, issues.length ? issues : [t.linksHealthy]).open();
+			}));
+		new Setting(containerEl).setName(t.migrateRoot).setDesc(t.migrateDesc).addButton((button) =>
+			button.setButtonText(t.btnRun).onClick(() => {
+				new SyncReportModal(this.app, t.migrateConfirm, [t.migrateConfirmDesc], async () => {
+					const warnings = await this.plugin.engine.migrateToRoot();
+					new SyncReportModal(this.app, t.migrationDone, warnings.length ? warnings : [t.linksHealthy]).open();
+					this.display();
+				}).open();
+			}));
 
 		// 前回の手動同期の結果（メモリ内のみ。詳細は最後の1〜数件を表示）
 		const stat = this.plugin.status.getSnapshot();
@@ -435,11 +489,15 @@ export class GdsyncSettingTab extends PluginSettingTab {
 			.addButton((btn) =>
 				btn.setWarning().setButtonText(t.btnReset).onClick(async () => {
 					const dirty = this.plugin.index.dirtyPaths().length;
-					if (dirty > 0) {
+					if (dirty > 0 || this.plugin.engine.isBusy() || this.plugin.index.data.pendingOps.length || this.plugin.index.data.incoming?.length) {
 						new Notice(t.unsentEdits(dirty));
 						return;
 					}
-					this.plugin.index.reset(s.rootFolderId);
+					// Keep stub identities and baselines; forgetting them makes a zero-byte
+					// placeholder indistinguishable from a real empty local file.
+					this.plugin.index.data.changesPageToken = null;
+					this.plugin.index.data.lastFullScan = 0;
+					this.plugin.index.markDirty();
 					await this.plugin.index.flush();
 					new Notice(t.indexReset);
 				})

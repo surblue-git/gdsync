@@ -7,6 +7,7 @@ import { GdsyncSettingTab } from "./settings";
 import { StatusDisplay } from "./status";
 import { SyncEngine } from "./sync-engine";
 import { DEFAULT_SETTINGS, GdsyncSettings } from "./types";
+import { recordParsedText } from "./attachment-links";
 import { Suppressor, VaultOps } from "./vault-ops";
 
 export default class GdsyncPlugin extends Plugin {
@@ -63,7 +64,7 @@ export default class GdsyncPlugin extends Plugin {
 				if (!file) return false;
 				const rel = this.engine.toRel(file.path);
 				const entry = rel ? this.index.getFile(rel) : undefined;
-				if (!entry?.fileId) return false;
+				if (!entry?.fileId || entry.dirty || !this.isActive()) return false;
 				if (!checking) {
 					entry.hydrated = false;
 					entry.hydratedMd5 = undefined;
@@ -99,12 +100,21 @@ export default class GdsyncPlugin extends Plugin {
 		// Vault イベントは起動時の初期スキャン（既存ファイル分の create 連発）を避けるため
 		// レイアウト完了後に登録する
 		this.app.workspace.onLayoutReady(() => {
-			void this.startup();
+			void this.startup().catch((e) => {
+				this.index.ready = false;
+				new Notice(String(e), 15000);
+			});
 		});
 	}
 
 	private async startup(): Promise<void> {
 		await this.index.load();
+		await this.engine.restoreMigrationState();
+		if (this.index.data.mountBase === undefined) {
+			this.index.data.mountBase = this.engine.basePath();
+			this.index.markDirty();
+			await this.index.flush();
+		}
 
 		this.registerEvent(
 			this.app.workspace.on("file-open", (file) => {
@@ -141,7 +151,8 @@ export default class GdsyncPlugin extends Plugin {
 		// 埋め込み添付をハイドレートする。file-open 時点ではまだスタブで埋め込みが
 		// 見えないケースをここで拾う。
 		this.registerEvent(
-			this.app.metadataCache.on("changed", (file) => {
+			this.app.metadataCache.on("changed", (file, data) => {
+				recordParsedText(file, data);
 				if (!(file instanceof TFile) || !this.isActive()) return;
 				const rel = this.engine.toRel(file.path);
 				if (rel === null || rel === "") return;
@@ -177,11 +188,10 @@ export default class GdsyncPlugin extends Plugin {
 		if (!Platform.isAndroidApp) return;
 		const adapter = this.app.vault.adapter;
 		const base = this.engine.basePath();
-		if (!base || base === "/") return;
-		const marker = `${base}/.nomedia`;
+		const marker = base ? `${base}/.nomedia` : ".nomedia";
 		try {
 			if (await adapter.exists(marker)) return;
-			if (!(await adapter.exists(base))) await adapter.mkdir(base);
+			if (base && !(await adapter.exists(base))) await adapter.mkdir(base);
 			await adapter.write(marker, "");
 		} catch (e) {
 			console.warn("gdsync: failed to create .nomedia", e);
@@ -204,18 +214,23 @@ export default class GdsyncPlugin extends Plugin {
 	/** 同期機能が有効か（設定完了 + プラットフォーム条件） */
 	isActive(): boolean {
 		const s = this.settings;
-		if (!s.tokens || !s.rootFolderId || !s.baseFolder) return false;
+		if (!this.index?.ready || this.engine?.migrating) return false;
+		if (!s.tokens || !s.rootFolderId || (s.mountMode !== "vaultRoot" && !s.baseFolder)) return false;
+		if (this.index.data.rootFolderId && this.index.data.rootFolderId !== s.rootFolderId) return false;
+		if (this.index.data.mountBase !== undefined && this.index.data.mountBase !== this.engine.basePath()) return false;
 		return Platform.isMobile || s.enableOnDesktop;
 	}
 
 	onunload(): void {
 		this.auth.dispose();
 		this.engine.queue.clear();
-		void this.index.flush();
+		void this.index.flush().catch((e) => console.error("gdsync: shutdown save failed", e));
 	}
 
 	async loadSettings(): Promise<void> {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+		const saved = await this.loadData();
+		this.settings = Object.assign({}, DEFAULT_SETTINGS, saved);
+		if (!saved) this.settings.mountMode = "vaultRoot";
 	}
 
 	async saveSettings(): Promise<void> {

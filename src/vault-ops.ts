@@ -24,6 +24,7 @@ export function isAlreadyExistsError(e: unknown): boolean {
 export class Suppressor {
 	private map = new Map<string, number[]>();
 	private static TTL_MS = 10_000;
+	clear(): void { this.map.clear(); }
 
 	add(path: string): void {
 		const list = this.map.get(path) || [];
@@ -49,7 +50,7 @@ export class Suppressor {
 
 /** Vault 操作ラッパー。Drive のことは知らない */
 export class VaultOps {
-	constructor(private app: App, public suppressor: Suppressor) {}
+	constructor(private app: App, public suppressor: Suppressor) { }
 
 	getFile(path: string): TFile | null {
 		const af = this.app.vault.getAbstractFileByPath(normalizePath(path));
@@ -73,7 +74,9 @@ export class VaultOps {
 		let cur = "";
 		for (const part of parts) {
 			cur = cur ? `${cur}/${part}` : part;
-			if (this.app.vault.getAbstractFileByPath(cur)) continue;
+			const existing = this.app.vault.getAbstractFileByPath(cur);
+			if (existing instanceof TFolder) continue;
+			if (existing) throw new Error(`Folder path is occupied by a file: ${cur}`);
 			this.suppressor.add(cur);
 			try {
 				await this.app.vault.createFolder(cur);
@@ -81,8 +84,8 @@ export class VaultOps {
 				// 「既に存在する」は無視する。Obsidian の索引は大文字小文字を区別する一方、
 				// Android 等のファイルシステムは区別しないため、索引上は未存在でも
 				// createFolder が "Folder already exists" を投げることがある。
-				if (isAlreadyExistsError(e)) continue;
-				if (this.app.vault.getAbstractFileByPath(cur)) continue;
+				this.suppressor.consume(cur);
+				if (this.app.vault.getAbstractFileByPath(cur) instanceof TFolder) continue;
 				throw e;
 			}
 		}
@@ -91,7 +94,9 @@ export class VaultOps {
 	/** 0バイトのスタブファイルを作成。既に存在すれば何もしない */
 	async createStub(path: string): Promise<void> {
 		const norm = normalizePath(path);
-		if (this.app.vault.getAbstractFileByPath(norm)) return;
+		const existing = this.app.vault.getAbstractFileByPath(norm);
+		if (existing instanceof TFile) return;
+		if (existing) throw new Error(`File path is occupied by a folder: ${norm}`);
 		const parent = norm.includes("/")
 			? norm.slice(0, norm.lastIndexOf("/"))
 			: "";
@@ -106,31 +111,33 @@ export class VaultOps {
 			}
 		} catch (e) {
 			// 大文字小文字を区別しないFS 等で「既に存在する」場合はスタブ済みとみなす
-			if (isAlreadyExistsError(e)) return;
-			if (this.app.vault.getAbstractFileByPath(norm)) return;
+			this.suppressor.consume(norm);
+			if (this.app.vault.getAbstractFileByPath(norm) instanceof TFile) return;
 			throw e;
 		}
 	}
 
 	/** ダウンロード内容をファイルへ書き込む（エディタ表示中でも安全に） */
-	async writeContent(file: TFile, data: ArrayBuffer): Promise<void> {
-		this.suppressor.add(file.path);
+	async writeContent(file: TFile, data: ArrayBuffer, guard: () => boolean = () => true): Promise<boolean> {
+		if (!guard()) return false;
+		let written = true;
 		if (isTextExt(file.extension)) {
 			const text = new TextDecoder("utf-8").decode(data);
-			await this.app.vault.process(file, () => text);
+			await this.app.vault.process(file, (current) => {
+				if (!guard()) { written = false; return current; }
+				this.suppressor.add(file.path);
+				return text;
+			});
 		} else {
+			this.suppressor.add(file.path);
 			await this.app.vault.modifyBinary(file, data);
 		}
+		return written;
 	}
 
 	/** キャッシュ追い出し: 内容を空に戻す */
-	async truncateToStub(file: TFile): Promise<void> {
-		this.suppressor.add(file.path);
-		if (isTextExt(file.extension)) {
-			await this.app.vault.process(file, () => "");
-		} else {
-			await this.app.vault.modifyBinary(file, new ArrayBuffer(0));
-		}
+	async truncateToStub(file: TFile, guard: () => boolean = () => true): Promise<boolean> {
+		return this.writeContent(file, new ArrayBuffer(0), guard);
 	}
 
 	/** 新しいファイルを内容付きで作成（競合コピー用） */

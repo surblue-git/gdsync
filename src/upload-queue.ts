@@ -1,144 +1,92 @@
 interface QueueItem {
-	timer: number;
-	failCount: number;
+	timer: number; failCount: number; done: Promise<void>; settle: () => void;
 }
-
-const MAX_BACKOFF_MS = 5 * 60 * 1000;
-
-/**
- * per-file デバウンス付きアップロードキュー。
- * 失敗（オフライン等）は指数バックオフで再スケジュールする。
- * 永続化はしない — dirty フラグがインデックスに残るため、
- * 再起動時は dirty エントリから再投入される。
- */
+/** Drains follow attempt objects, never historical completion of a path. */
 export class UploadQueue {
 	private items = new Map<string, QueueItem>();
-	/** 手動同期（drainPending）用: 少なくとも1回は実行を試みたパス */
-	private settled = new Set<string>();
-	private drainTargets: Set<string> | null = null;
-	private drainWaiters: Array<() => void> = [];
-
-	constructor(
-		private run: (path: string) => Promise<boolean>,
-		private baseDelayMs: () => number
-	) {}
-
-	/** 編集のたびに呼ぶ。既存タイマーはリセット（デバウンス） */
+	private active = new Set<Promise<void>>();
+	private paused = false;
+	private stopped = false;
+	private activePaths = new Set<string>();
+	private ready = new Map<string, QueueItem>();
+	constructor(private run: (path: string) => Promise<boolean>, private baseDelayMs: () => number) { }
 	schedule(path: string, immediate = false): void {
-		const existing = this.items.get(path);
-		if (existing) window.clearTimeout(existing.timer);
-		const failCount = existing?.failCount ?? 0;
-		const delay = immediate ? 0 : this.delayFor(failCount);
-		const timer = window.setTimeout(() => void this.execute(path), delay);
-		this.items.set(path, { timer, failCount });
+		if (this.stopped) return;
+		const previous = this.items.get(path);
+		if (previous) window.clearTimeout(previous.timer);
+		let settle!: () => void;
+		const done = new Promise<void>((resolve) => { settle = resolve; });
+		const item: QueueItem = { timer: 0, failCount: previous?.failCount ?? 0, done, settle };
+		if (previous) void done.then(previous.settle);
+		this.items.set(path, item);
+		if (!this.paused) this.arm(path, item, immediate ? 0 : this.delay(item.failCount));
 	}
-
-	/** rename でキー変更 */
+	private delay(n: number): number { return Math.min(300000, this.baseDelayMs() * Math.pow(2, n)); }
+	private arm(path: string, item: QueueItem, delay: number): void {
+		item.timer = window.setTimeout(() => {
+			if (this.items.get(path) !== item) return;
+			this.ready.set(path, item);
+			this.pump();
+		}, delay);
+	}
+	private pump(): void {
+		if (this.paused || this.stopped) return;
+		for (const [path, item] of this.ready) {
+			if (this.active.size >= 3) break;
+			if (this.activePaths.has(path)) continue;
+			this.ready.delete(path);
+			if (this.items.get(path) !== item) continue;
+			this.activePaths.add(path);
+			const task = this.execute(path, item);
+			this.active.add(task);
+			void task.finally(() => { this.active.delete(task); this.activePaths.delete(path); this.pump(); });
+		}
+	}
+	async pause(): Promise<void> {
+		this.paused = true;
+		this.ready.clear();
+		for (const item of this.items.values()) window.clearTimeout(item.timer);
+		await Promise.all(Array.from(this.active));
+	}
+	resume(): void {
+		if (this.stopped || !this.paused) return;
+		this.paused = false;
+		for (const [path, item] of this.items) this.arm(path, item, this.delay(item.failCount));
+	}
 	rename(oldPath: string, newPath: string): void {
-		const item = this.items.get(oldPath);
-		if (!item) return;
-		this.items.delete(oldPath);
-		window.clearTimeout(item.timer);
-		this.settled.add(oldPath);
-		this.notifySettled();
-		this.schedule(newPath);
+		if (!this.items.has(oldPath)) return;
+		this.cancel(oldPath); this.schedule(newPath);
 	}
-
 	cancel(path: string): void {
 		const item = this.items.get(path);
-		if (item) {
-			window.clearTimeout(item.timer);
-			this.items.delete(path);
-			this.settled.add(path);
-			this.notifySettled();
-		}
-	}
-
-	has(path: string): boolean {
-		return this.items.has(path);
-	}
-
-	/** 手動同期: 待機中のものを全部すぐ実行 */
-	flushAll(): void {
-		for (const path of Array.from(this.items.keys())) {
-			this.schedule(path, true);
-		}
-	}
-
-	clear(): void {
-		for (const item of this.items.values()) window.clearTimeout(item.timer);
-		this.items.clear();
-	}
-
-	/**
-	 * 呼び出し時点でキュー内にあるアイテムが「少なくとも1回は実行を試み、
-	 * その試行が完了する」のを待つ。
-	 * 失敗してバックオフ再スケジュールされた分は待たない（以降は自動リトライ）。
-	 * 空キューなら即解決。手動同期の完了サマリー集計用。
-	 */
-	async drainPending(): Promise<void> {
-		const keys = Array.from(this.items.keys());
-		if (keys.length === 0) return;
-		if (this.drainTargets) {
-			for (const k of keys) this.drainTargets.add(k);
-		} else {
-			this.drainTargets = new Set(keys);
-		}
-		if ([...this.drainTargets].every((p) => this.settled.has(p))) {
-			this.drainTargets = null;
-			this.settled.clear();
-			return;
-		}
-		await new Promise<void>((resolve) => this.drainWaiters.push(resolve));
-	}
-
-	private delayFor(failCount: number): number {
-		const base = this.baseDelayMs();
-		if (failCount === 0) return base;
-		return Math.min(MAX_BACKOFF_MS, base * Math.pow(2, failCount));
-	}
-
-	private notifySettled(): void {
-		const target = this.drainTargets;
-		if (!target) return;
-		for (const p of target) {
-			if (!this.settled.has(p)) return;
-		}
-		this.drainTargets = null;
-		const waiters = this.drainWaiters;
-		this.drainWaiters = [];
-		this.settled.clear();
-		for (const w of waiters) w();
-	}
-
-	private async execute(path: string): Promise<void> {
-		const item = this.items.get(path);
 		if (!item) return;
+		window.clearTimeout(item.timer); this.items.delete(path); item.settle();
+		this.ready.delete(path);
+	}
+	has(path: string): boolean { return this.items.has(path); }
+	flushAll(): void { for (const path of this.items.keys()) this.schedule(path, true); }
+	clear(): void { this.stopped = true; for (const path of this.items.keys()) this.cancel(path); }
+	async drainPending(): Promise<void> {
+		await Promise.all([...Array.from(this.items.values(), (i) => i.done), ...this.active]);
+	}
+	async runNow(paths: string[]): Promise<void> {
+		for (const path of paths) this.schedule(path, true);
+		await Promise.all(paths.map((path) => this.items.get(path)?.done));
+	}
+	private async execute(path: string, item: QueueItem): Promise<void> {
+		if (this.paused || this.stopped || this.items.get(path) !== item) return;
 		let ok = false;
-		try {
-			ok = await this.run(path);
-		} catch (e) {
-			console.error("gdsync: upload failed", path, e);
-			ok = false;
-		}
-		const cur = this.items.get(path);
-		this.settled.add(path);
-		// 実行中に再スケジュールされていたら触らない（試行は完了扱い）
-		if (cur !== item) {
-			this.notifySettled();
-			return;
-		}
-		if (ok) {
+		try { ok = await this.run(path); } catch (e) { console.error('gdsync: upload failed', path, e); }
+		if (this.items.get(path) === item) {
 			this.items.delete(path);
-		} else {
-			// リトライ（バックオフ）
-			const failCount = item.failCount + 1;
-			const timer = window.setTimeout(
-				() => void this.execute(path),
-				this.delayFor(failCount)
-			);
-			this.items.set(path, { timer, failCount });
+			if (!ok && !this.stopped) {
+				this.schedule(path);
+				const retry = this.items.get(path)!;
+				retry.failCount = item.failCount + 1;
+				window.clearTimeout(retry.timer);
+				if (!this.paused) this.arm(path, retry, this.delay(retry.failCount));
+			}
 		}
-		this.notifySettled();
+		item.settle();
 	}
 }
