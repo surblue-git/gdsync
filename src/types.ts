@@ -140,12 +140,18 @@ export interface IndexEntry {
 	revision?: number;
 	localMtime?: number;
 	localSize?: number;
+	/** MD5 of the local bytes at the last completed reconciliation. */
+	localMd5?: string;
+	/** Explicit state prevents an unresolved conflict from being uploaded automatically. */
+	syncState?: "clean" | "localChanged" | "conflict" | "unknown";
+	/** A local recovery artifact that must never be uploaded automatically. */
+	recoveryOnly?: boolean;
 	/** Persisted before creating a remote file, for idempotent retry. */
 	creationId?: string;
-	conflictCopy?: { rel: string; creationId: string; revision: number };
+	conflictCopy?: { rel: string; creationId: string; revision: number; remoteRel?: string };
 	/** キャッシュ追い出し判定用 */
 	lastAccess: number;
-	/** ハイドレートした時点のリモートmd5 */
+	/** Last MD5 known to be common to both local bytes and the Drive file. */
 	hydratedMd5?: string;
 	/** 最後に鮮度確認した時刻 */
 	lastFreshCheck?: number;
@@ -164,7 +170,7 @@ export type PendingOp =
 	| { kind: "trashRemote"; fileId: string };
 
 export interface GdsyncIndex {
-	version: 1;
+	version: 2;
 	rootFolderId: string;
 	changesPageToken: string | null;
 	lastFullScan: number;
@@ -182,7 +188,7 @@ export interface GdsyncIndex {
 
 export function emptyIndex(): GdsyncIndex {
 	return {
-		version: 1,
+		version: 2,
 		rootFolderId: "",
 		changesPageToken: null,
 		lastFullScan: 0,

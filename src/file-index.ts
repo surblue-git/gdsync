@@ -27,9 +27,13 @@ export class FileIndex {
 	async load(): Promise<void> {
 		const adapter = this.plugin.app.vault.adapter;
 		const parse = (raw: string): GdsyncIndex => {
-			const parsed = JSON.parse(raw) as GdsyncIndex;
-			if (!parsed || parsed.version !== 1 || !parsed.files || !parsed.folders || !Array.isArray(parsed.pendingOps)) throw new Error("Invalid index");
-			return parsed;
+			const parsed = JSON.parse(raw) as Omit<GdsyncIndex, "version"> & { version: number };
+			if (!parsed || ![1, 2].includes(parsed.version) || !parsed.files || !parsed.folders || !Array.isArray(parsed.pendingOps)) throw new Error("Invalid index");
+			// Version 2 adds content fingerprints. Individual files remain unverified until
+			// SyncEngine.reconcileLocal hashes their bytes, so an interrupted upgrade is safe.
+			if (parsed.version === 1) this.pendingSave = true;
+			parsed.version = 2;
+			return parsed as GdsyncIndex;
 		};
 		try {
 			if (await adapter.exists(this.filePath)) {

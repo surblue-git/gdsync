@@ -17,6 +17,7 @@ import type GdsyncPlugin from "./main";
 import { mountBase, relativePath, vaultPath, protectedPath } from "./sync-paths";
 import { attachmentReferences, freshLinkCache, invalidateLinkCache } from "./attachment-links";
 import { MountMigration } from "./mount-migration";
+import { md5Hex } from "./content-md5";
 
 const MIME_BY_EXT: Record<string, string> = {
 	md: "text/markdown",
@@ -180,22 +181,51 @@ export class SyncEngine {
 		} finally { this.migrationRunning = false; }
 	}
 
-	/** Detect edits made while the app was closed; unknown files are always real data. */
+	/**
+	 * Detect edits made while the app was closed. Stat values are only hints: the
+	 * content hash is authoritative so same-size edits with a preserved mtime are safe.
+	 */
 	private async reconcileLocal(): Promise<void> {
 		for (const file of this.plugin.app.vault.getFiles()) {
 			const rel = this.toRel(file.path);
 			if (!rel || this.isExcluded(rel)) continue;
 			const e = this.index.getFile(rel);
-			if (!e) this.trackNewLocalFile(rel);
-			else if ((e.hydrated && e.localMtime === undefined) || (e.localMtime !== undefined &&
-				(e.localMtime !== file.stat.mtime || e.localSize !== file.stat.size)) ||
-				(!e.hydrated && file.stat.size > 0)) {
-				e.hydrated = true;
-				e.dirty = true;
-				e.revision = (e.revision ?? 0) + 1;
+			if (!e) { this.trackNewLocalFile(rel); continue; }
+			if (e.recoveryOnly) { this.rememberLocal(file, e); continue; }
+			if (!e.hydrated && file.stat.size === 0) {
 				this.rememberLocal(file, e);
-				this.index.markDirty();
+				continue;
 			}
+
+			const localMd5 = md5Hex(await this.ops.readBinary(file));
+			const previousObserved = e.localMd5 ?? e.hydratedMd5;
+			const changedSinceObservation = previousObserved !== undefined && previousObserved !== localMd5;
+			e.hydrated = true;
+			e.localMd5 = localMd5;
+			this.rememberLocal(file, e);
+
+			if (e.syncState === "conflict") {
+				e.dirty = true;
+			} else if (!e.fileId) {
+				e.dirty = true;
+				e.syncState = "localChanged";
+			} else if (e.hydratedMd5 !== undefined) {
+				e.dirty = localMd5 !== e.hydratedMd5;
+				e.syncState = e.dirty ? "localChanged" : "clean";
+			} else if (e.remoteMd5 && localMd5 === e.remoteMd5) {
+				// Legacy entries without a baseline can be proven clean when their bytes
+				// match Drive's last observed checksum.
+				e.hydratedMd5 = e.remoteMd5;
+				e.dirty = false;
+				e.syncState = "clean";
+			} else {
+				// There is no trustworthy common ancestor. Preserve the local bytes and
+				// require three-way conflict handling before either side is replaced.
+				e.dirty = true;
+				e.syncState = "unknown";
+			}
+			if (changedSinceObservation) e.revision = (e.revision ?? 0) + 1;
+			this.index.markDirty();
 		}
 		await this.index.flush();
 	}
@@ -496,6 +526,7 @@ export class SyncEngine {
 							remoteSize: num(meta.size),
 							hydrated: false,
 							dirty: false,
+							syncState: "clean",
 							lastAccess: 0,
 							tooLarge: num(meta.size) > maxSize,
 						});
@@ -511,12 +542,17 @@ export class SyncEngine {
 							existing.fileId = meta.id;
 							existing.hydrated = false;
 							existing.hydratedMd5 = undefined;
+							existing.localMd5 = undefined;
 							existing.dirty = false;
+							existing.syncState = "clean";
 							created++;
 						} else if (existing.fileId !== meta.id) {
 							existing.fileId = meta.id;
-							// Preserve cached bytes. A later guarded download compares the new remote hash.
+							// A different Drive object now occupies this path. Preserve cached bytes
+							// and force conservative conflict classification.
 							existing.hydratedMd5 = undefined;
+							existing.dirty = existing.hydrated;
+							existing.syncState = existing.hydrated ? "unknown" : "clean";
 						}
 						existing.remoteMd5 = meta.md5Checksum ?? null;
 						existing.remoteModifiedTime = ts(meta.modifiedTime);
@@ -662,12 +698,16 @@ export class SyncEngine {
 		let ok = false;
 		try {
 			const data = await this.drive.download(entry.fileId);
+			const localMd5 = md5Hex(data);
 			const unchanged = () => (entry.revision ?? 0) === revision &&
 				file.path === expectedPath && file.stat.mtime === expectedMtime && !entry.dirty;
 			if (!await this.ops.writeContent(file, data, unchanged)) return false;
 			entry.hydrated = true;
-			entry.hydratedMd5 = remoteMd5 ?? undefined;
+			entry.hydratedMd5 = remoteMd5 ?? localMd5;
+			entry.remoteMd5 = remoteMd5 ?? localMd5;
+			entry.localMd5 = localMd5;
 			entry.dirty = false;
+			entry.syncState = "clean";
 			entry.lastAccess = Date.now();
 			entry.lastFreshCheck = Date.now();
 			this.rememberLocal(file, entry);
@@ -703,8 +743,10 @@ export class SyncEngine {
 			// Preserve the edit. With no baseline, upload creates a conflict copy.
 			entry.hydrated = true;
 			entry.hydratedMd5 = undefined;
+			entry.syncState = "unknown";
 		}
 		entry.dirty = true;
+		if (entry.syncState !== "conflict") entry.syncState = "localChanged";
 		entry.revision = (entry.revision ?? 0) + 1;
 		this.rememberLocal(file, entry);
 		this.index.markDirty();
@@ -736,6 +778,7 @@ export class SyncEngine {
 			remoteSize: 0,
 			hydrated: true, // ローカル生まれ = ローカルが実体
 			dirty: true,
+			syncState: "localChanged",
 			revision: 1,
 			localMtime: file?.stat.mtime,
 			localSize: file?.stat.size,
@@ -894,6 +937,11 @@ export class SyncEngine {
 			if (this.isExcluded(rel)) return true;
 			const entry = this.index.getFile(rel);
 			if (!entry || !entry.dirty) return true;
+			if (entry.recoveryOnly) return true;
+			if (entry.syncState === "conflict") {
+				this.pendingIssues.add(rel);
+				return true;
+			}
 			if (!entry.hydrated) return true; // ガード2: 実体なしは絶対に送らない
 			const file = this.ops.getFile(this.toVault(rel));
 			if (!file) return true; // 既に消えていた
@@ -905,6 +953,8 @@ export class SyncEngine {
 			} catch (e) {
 				return false;
 			}
+			const localMd5 = md5Hex(data);
+			entry.localMd5 = localMd5;
 			if (file.extension === "md" && !await this.uploadAttachments(file, new TextDecoder().decode(data))) return false;
 			if ((entry.revision ?? 0) !== revision || file.stat.mtime !== mtimeBeforeUpload) return false;
 			// ガード3: ローカルが空でリモートに内容がある場合は事故防止のため送らない
@@ -935,13 +985,40 @@ export class SyncEngine {
 						if (remote.trashed) {
 							entry.creationId = undefined;
 							entry.fileId = ""; // ゴミ箱行き → 新規作成で復活
-						} else if (
-							remote.md5Checksum &&
-							remote.md5Checksum !== entry.hydratedMd5
-						) {
-							await this.resolveConflict(rel, file, entry, data, remote, revision);
-							ok = true;
-							return true;
+						} else if (remote.md5Checksum) {
+							const baseMd5 = entry.hydratedMd5;
+							const localChanged = baseMd5 === undefined || localMd5 !== baseMd5;
+							const remoteChanged = baseMd5 === undefined || remote.md5Checksum !== baseMd5;
+
+							if (localMd5 === remote.md5Checksum) {
+								// Both sides already contain identical bytes.
+								entry.hydratedMd5 = remote.md5Checksum;
+								entry.remoteMd5 = remote.md5Checksum;
+								entry.remoteModifiedTime = ts(remote.modifiedTime);
+								entry.remoteSize = num(remote.size);
+								entry.dirty = false;
+								entry.syncState = "clean";
+								entry.conflictCopy = undefined;
+								this.rememberLocal(file, entry);
+								this.index.markDirty();
+								await this.index.flush();
+								ok = true;
+								return true;
+							}
+							if (localChanged && remoteChanged) {
+								await this.resolveConflict(rel, file, entry, data, remote, revision);
+								ok = true;
+								return true;
+							}
+							if (!localChanged && remoteChanged) {
+								entry.remoteMd5 = remote.md5Checksum;
+								entry.remoteModifiedTime = ts(remote.modifiedTime);
+								entry.remoteSize = num(remote.size);
+								entry.dirty = false;
+								if (!await this.downloadInto(file, entry)) entry.dirty = true;
+								ok = true;
+								return true;
+							}
 						}
 					}
 				}
@@ -980,7 +1057,10 @@ export class SyncEngine {
 				entry.remoteMd5 = res.md5Checksum ?? null;
 				entry.remoteModifiedTime = ts(res.modifiedTime);
 				entry.remoteSize = num(res.size);
-				if (!res.gdsyncRecovered) entry.hydratedMd5 = res.md5Checksum;
+				if (!res.gdsyncRecovered) {
+					entry.hydratedMd5 = res.md5Checksum;
+					entry.localMd5 = localMd5;
+				}
 				// アップロード中に再編集されていたら dirty を維持して再送
 				const nowFile = this.ops.getFile(this.toVault(currentRel));
 				const editedMeanwhile =
@@ -988,6 +1068,7 @@ export class SyncEngine {
 					(entry.revision ?? 0) !== revision ||
 					!!nowFile && nowFile.stat.mtime !== mtimeBeforeUpload;
 				entry.dirty = editedMeanwhile;
+				entry.syncState = editedMeanwhile ? "localChanged" : "clean";
 				if (nowFile && !editedMeanwhile) this.rememberLocal(nowFile, entry);
 				this.index.setFile(currentRel, entry);
 				await this.index.flush();
@@ -1015,8 +1096,9 @@ export class SyncEngine {
 	}
 
 	/**
-	 * 競合: ローカル版を「(conflict …)」として Drive とローカル両方に保存し、
-	 * 元ファイルはリモート版で復元する。
+	 * 競合: ローカル版を別名でDriveへ保全し、リモート版もローカルの
+	 * recovery copyへ保存する。編集中の元ファイルは変更せず、明示的な
+	 * 「アップロード」または「再ダウンロード」まで保留する。
 	 */
 	private async resolveConflict(
 		rel: string,
@@ -1044,7 +1126,8 @@ export class SyncEngine {
 		if (!copyEntry) {
 			copyEntry = {
 				fileId: '', creationId: copy.creationId, hydrated: true, dirty: true,
-				remoteMd5: null, remoteSize: 0, remoteModifiedTime: 0, lastAccess: Date.now(), revision: 1
+				remoteMd5: null, remoteSize: 0, remoteModifiedTime: 0, lastAccess: Date.now(), revision: 1,
+				localMd5: md5Hex(localData), syncState: "localChanged"
 			};
 			this.rememberLocal(localCopy, copyEntry);
 			this.index.setFile(copy.rel, copyEntry);
@@ -1060,23 +1143,54 @@ export class SyncEngine {
 			copyEntry.fileId = uploaded.id;
 			copyEntry.remoteMd5 = uploaded.md5Checksum ?? null;
 			copyEntry.hydratedMd5 = uploaded.md5Checksum;
+			copyEntry.localMd5 = md5Hex(localData);
 			copyEntry.remoteSize = num(uploaded.size);
 			copyEntry.dirty = localCopy.stat.mtime !== stamp;
+			copyEntry.syncState = copyEntry.dirty ? "localChanged" : "clean";
 			this.index.setFile(copy.rel, copyEntry);
 			await this.index.flush();
 		}
 
-		// 元ファイルはリモート版で上書き
+		// Preserve the remote side locally without replacing the original editor buffer.
+		if (!copy.remoteRel) {
+			const dot = file.name.lastIndexOf('.');
+			const stem = dot > 0 ? file.name.slice(0, dot) : file.name;
+			const ext = dot > 0 ? file.name.slice(dot) : '';
+			let name = `${stem} (remote conflict ${conflictStamp()}-${Date.now()})${ext}`;
+			let remoteRel = joinPath(parentOf(rel), name);
+			let suffix = 1;
+			while (this.ops.exists(this.toVault(remoteRel))) {
+				name = `${stem} (remote conflict ${conflictStamp()}-${Date.now()}-${suffix++})${ext}`;
+				remoteRel = joinPath(parentOf(rel), name);
+			}
+			copy.remoteRel = remoteRel;
+			this.index.markDirty();
+			await this.index.flush();
+		}
+		if (!this.ops.getFile(this.toVault(copy.remoteRel))) {
+			const remoteData = await this.drive.download(entry.fileId);
+			const remoteCopy = await this.ops.createWithContent(this.toVault(copy.remoteRel), remoteData);
+			const remoteHash = md5Hex(remoteData);
+			const remoteCopyEntry: IndexEntry = {
+				fileId: '', remoteMd5: null, remoteModifiedTime: 0, remoteSize: remoteData.byteLength,
+				hydrated: true, dirty: false, localMd5: remoteHash, syncState: "clean",
+				recoveryOnly: true, lastAccess: Date.now(), revision: 0
+			};
+			this.rememberLocal(remoteCopy, remoteCopyEntry);
+			this.index.setFile(copy.remoteRel, remoteCopyEntry);
+			await this.index.flush();
+		}
+
 		entry.remoteMd5 = remote.md5Checksum ?? null;
 		entry.remoteModifiedTime = ts(remote.modifiedTime);
 		entry.remoteSize = num(remote.size);
-		if ((entry.revision ?? 0) === revision) {
-			entry.dirty = false;
-			if (!await this.downloadInto(file, entry)) entry.dirty = true;
-		}
+		entry.localMd5 = md5Hex(await this.ops.readBinary(file));
+		entry.dirty = true;
+		entry.syncState = "conflict";
+		this.pendingIssues.add(rel);
 		this.index.markDirty();
 		await this.index.flush();
-		new Notice(t.conflictDetected(conflictName, file.name));
+		new Notice(t.conflictDetected(conflictName, baseName(copy.remoteRel), file.name));
 	}
 
 	// ---------------- リモートフォルダ解決 ----------------
@@ -1336,6 +1450,7 @@ export class SyncEngine {
 				remoteSize: num(meta.size),
 				hydrated: false,
 				dirty: false,
+				syncState: "clean",
 				lastAccess: 0,
 				tooLarge:
 					num(meta.size) > this.plugin.settings.maxFileSizeMB * 1024 * 1024,
@@ -1354,6 +1469,7 @@ export class SyncEngine {
 			// ローカル編集を保護: 次回アップロードで新規作成される
 			entry.fileId = "";
 			entry.creationId = undefined;
+			entry.syncState = "localChanged";
 			this.index.setFile(rel, entry);
 			return;
 		}
@@ -1371,6 +1487,7 @@ export class SyncEngine {
 			if (e.dirty) {
 				e.fileId = "";
 				e.creationId = undefined;
+				e.syncState = "localChanged";
 				this.index.setFile(f, e);
 				keptFiles.push(f);
 			} else {
@@ -1491,6 +1608,8 @@ export class SyncEngine {
 				this.rememberLocal(f, entry);
 				entry.hydrated = false;
 				entry.hydratedMd5 = undefined;
+				entry.localMd5 = undefined;
+				entry.syncState = "clean";
 				this.index.markDirty();
 				evicted++;
 			});

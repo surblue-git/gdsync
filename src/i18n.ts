@@ -148,8 +148,8 @@ const en = {
 		`GDSync: Upload of ${name} was cancelled because it is empty while the remote copy has content. If this is intentional, open the remote version once and then edit it.`,
 	offlineUploadPending: "Offline (upload pending)",
 	uploadFailed: (name: string) => `Failed to upload ${name}`,
-	conflictDetected: (conflictName: string, name: string) =>
-		`GDSync: Conflict detected. The local version was saved as "${conflictName}" and ${name} was updated to the remote version.`,
+	conflictDetected: (localName: string, remoteName: string, name: string) =>
+		`GDSync: Conflict detected in ${name}. The open file was left unchanged. Local backup: "${localName}"; remote version: "${remoteName}". Use Upload current file or Re-download current file to resolve it.`,
 	changeTokenExpired: "GDSync: The change token has expired. Running a full scan.",
 	syncing: "Syncing…",
 	syncFailed: "Sync failed",
@@ -375,8 +375,8 @@ const ja: Strings = {
 		`GDSync: ${name} は空でリモート側に内容があるため、アップロードを中止しました。意図的な場合は、一度リモート版を開いてから編集してください。`,
 	offlineUploadPending: "オフライン（アップロード保留中）",
 	uploadFailed: (name: string) => `${name} のアップロードに失敗`,
-	conflictDetected: (conflictName: string, name: string) =>
-		`GDSync: 競合を検出しました。ローカル版を「${conflictName}」として保存し、${name} はリモート版に更新しました。`,
+	conflictDetected: (localName: string, remoteName: string, name: string) =>
+		`GDSync: ${name} の競合を検出しました。編集中のファイルは変更していません。ローカル版の退避:「${localName}」、Drive版:「${remoteName}」。解決するには「現在のファイルを今すぐアップロード」または「現在のファイルを再ダウンロード」を実行してください。`,
 	changeTokenExpired: "GDSync: 差分トークンが失効しました。フルスキャンを実行します。",
 	syncing: "同期中…",
 	syncFailed: "同期に失敗しました",

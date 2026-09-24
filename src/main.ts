@@ -64,11 +64,12 @@ export default class GdsyncPlugin extends Plugin {
 				if (!file) return false;
 				const rel = this.engine.toRel(file.path);
 				const entry = rel ? this.index.getFile(rel) : undefined;
-				if (!entry?.fileId || entry.dirty || !this.isActive()) return false;
+				if (!entry?.fileId || (entry.dirty && entry.syncState !== "conflict") || !this.isActive()) return false;
 				if (!checking) {
 					entry.hydrated = false;
-					entry.hydratedMd5 = undefined;
 					entry.dirty = false;
+					entry.syncState = "clean";
+					entry.conflictCopy = undefined;
 					this.index.markDirty();
 					void this.engine.onFileOpen(file);
 				}
@@ -85,7 +86,13 @@ export default class GdsyncPlugin extends Plugin {
 				const entry = rel ? this.index.getFile(rel) : undefined;
 				if (!entry || !entry.hydrated) return false;
 				if (!checking) {
+					// Explicit upload also resolves a blocked conflict in favor of local bytes.
+					if (entry.syncState === "conflict") entry.hydratedMd5 = entry.remoteMd5 ?? undefined;
+					entry.recoveryOnly = false;
 					entry.dirty = true;
+					entry.syncState = "localChanged";
+					entry.conflictCopy = undefined;
+					entry.revision = (entry.revision ?? 0) + 1;
 					this.index.markDirty();
 					this.engine.queue.schedule(rel!, true);
 				}
