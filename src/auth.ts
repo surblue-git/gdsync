@@ -3,6 +3,7 @@ import type { Server } from "http";
 import { t } from "./i18n";
 import type GdsyncPlugin from "./main";
 import { applySharedSettings, pickSharedSettings, SharedSettings } from "./types";
+import { readWithTimeout } from "./request-timeout";
 
 const AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token";
@@ -379,16 +380,16 @@ export class AuthManager {
 		});
 		let res;
 		try {
-			res = await requestUrl({
+			res = await readWithTimeout(requestUrl({
 				url: TOKEN_ENDPOINT,
 				method: "POST",
 				contentType: "application/x-www-form-urlencoded",
 				body: body.toString(),
 				throw: false,
-			});
+			}), "Google OAuth");
 		} catch (e) {
 			// ネットワーク断はトークンを破棄しない
-			throw new Error(t.tokenRefreshOffline);
+			throw new Error(`${t.tokenRefreshOffline}: ${e instanceof Error ? e.message : String(e)}`);
 		}
 		if (res.status >= 400) {
 			const err = res.json?.error;

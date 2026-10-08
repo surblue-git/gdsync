@@ -111,11 +111,17 @@ class SyncReportModal extends Modal {
 }
 
 export class GdsyncSettingTab extends PluginSettingTab {
+	private statusTimer: number | null = null;
+	hide(): void {
+		if (this.statusTimer !== null) window.clearInterval(this.statusTimer);
+		this.statusTimer = null;
+	}
 	constructor(app: App, private plugin: GdsyncPlugin) {
 		super(app, plugin);
 	}
 
 	display(): void {
+		this.hide();
 		const { containerEl } = this;
 		containerEl.empty();
 		const s = this.plugin.settings;
@@ -454,13 +460,23 @@ export class GdsyncSettingTab extends PluginSettingTab {
 			}));
 
 		// 前回の手動同期の結果（メモリ内のみ。詳細は最後の1〜数件を表示）
-		const stat = this.plugin.status.getSnapshot();
-		const lastAt = stat.lastSyncAt
-			? moment(stat.lastSyncAt).format("YYYY-MM-DD HH:mm")
-			: t.syncNever;
-		new Setting(containerEl)
-			.setName(t.syncStateLabel(lastAt))
-			.setDesc(stat.lastSummary ?? t.syncNoSummary);
+		const syncState = new Setting(containerEl);
+		const syncDetails = new Setting(containerEl).setName(t.syncDetails);
+		syncDetails.descEl.addClass("gdsync-sync-details");
+		syncState.descEl.setAttribute("role", "status");
+		const updateState = () => {
+			const stat = this.plugin.status.getSnapshot();
+			const lastAt = stat.lastSyncAt ? moment(stat.lastSyncAt).format("YYYY-MM-DD HH:mm") : t.syncNever;
+			syncState.setName(t.syncStateLabel(lastAt)).setDesc(stat.lastSummary ?? (stat.lastSyncAt ? t.syncNoChanges : t.syncNoSummary));
+			const details = this.plugin.engine.getDiagnostics().join("\n");
+			if (syncDetails.descEl.textContent !== details) syncDetails.setDesc(details);
+		};
+		updateState();
+		this.statusTimer = window.setInterval(() => {
+			if (!containerEl.isConnected) { this.hide(); return; }
+			updateState();
+		}, 1000);
+		this.plugin.registerInterval(this.statusTimer);
 
 		new Setting(containerEl)
 			.setName(t.settingsSyncNow)

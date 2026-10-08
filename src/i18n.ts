@@ -38,6 +38,19 @@ function detectLang(): "ja" | "en" {
 }
 
 const en = {
+	syncDetails: "Sync details",
+	syncIdle: "Idle",
+	syncWaiting: "Waiting for transfers / file operations",
+	syncReconciling: "Checking local files",
+	syncReceiving: "Fetching Drive changes",
+	syncApplying: (n: number, total: number, name: string) => `Applying changes ${n}/${total}: ${name}`,
+	syncSending: "Sending local changes",
+	syncSaving: "Saving sync records",
+	syncScanning: "Scanning Drive",
+	syncElapsed: (seconds: number) => `Current step: ${seconds}s`,
+	syncCounts: (files: number, uploads: number, changes: number, locks: number) => `Registered ${files}; unsent ${uploads}; incoming ${changes}; file operations ${locks}`,
+	syncRecovered: (n: number) => `Recovered empty stubs: ${n}`,
+	syncEmptyBlocked: "Empty local file matches a pending Drive change; upload paused until the remote identity is checked.",
 	indexRecovered: "GDSync: Recovered the sync index from a saved checkpoint. Local files will be reconciled before syncing.",
 	indexRecoveryFailed: "GDSync: The sync index could not be recovered. Sync is stopped to protect local files.",
 
@@ -265,6 +278,19 @@ const en = {
 type Strings = typeof en;
 
 const ja: Strings = {
+	syncDetails: "同期の詳細",
+	syncIdle: "待機中",
+	syncWaiting: "送受信・ファイル処理の終了待ち",
+	syncReconciling: "ローカルファイルを照合中",
+	syncReceiving: "Driveの差分を取得中",
+	syncApplying: (n: number, total: number, name: string) => `差分を適用中 ${n}/${total}: ${name}`,
+	syncSending: "ローカル変更を送信中",
+	syncSaving: "同期記録を保存中",
+	syncScanning: "Driveをスキャン中",
+	syncElapsed: (seconds: number) => `現在の処理の経過時間: ${seconds}秒`,
+	syncCounts: (files: number, uploads: number, changes: number, locks: number) => `登録${files}件・未送信${uploads}件・未適用差分${changes}件・ファイル処理${locks}件`,
+	syncRecovered: (n: number) => `空スタブの復旧: ${n}件`,
+	syncEmptyBlocked: "未適用のDrive差分と同名の空ファイルです。Driveとの対応確認まで送信を保留します。",
 	indexRecovered: "GDSync: 保存済みの同期記録から復旧しました。ローカルファイルを照合してから同期します。",
 	indexRecoveryFailed: "GDSync: 同期記録を復旧できませんでした。ローカルファイル保護のため同期を停止しています。",
 

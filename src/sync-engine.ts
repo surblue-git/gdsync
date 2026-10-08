@@ -67,6 +67,15 @@ function baseName(p: string): string {
 	return i < 0 ? p : p.slice(i + 1);
 }
 
+/** Drive permits identical sibling names. Keep each remote identity separately. */
+function driveAliasName(name: string, id: string): string {
+	const dot = name.lastIndexOf(".");
+	const ext = dot > 0 ? name.slice(dot) : "";
+	let stem = dot > 0 ? name.slice(0, dot) : name;
+	while (new TextEncoder().encode(stem).byteLength > 150) stem = Array.from(stem).slice(0, -1).join("");
+	return `${stem} (Drive ${id.replace(/[^a-zA-Z0-9_-]/g, "_")})${ext}`;
+}
+
 function conflictStamp(): string {
 	const d = new Date();
 	const pad = (n: number) => String(n).padStart(2, "0");
@@ -90,6 +99,32 @@ export class SyncEngine {
 	private pendingIssues = new Set<string>();
 	private openAttachments = new Set<string>();
 	private migrationRunning = false;
+	private step = "";
+	private stepAt = 0;
+	private recovered = 0;
+	private lastError = "";
+	private networkFailed = false;
+	private parentMetas = new Map<string, Promise<DriveItemMeta>>();
+	private parentPaths = new Map<string, string | undefined>();
+
+	private setStep(text: string): void {
+		this.step = text;
+		this.stepAt = Date.now();
+	}
+
+	getDiagnostics(): string[] {
+		const snap = this.status.getSnapshot();
+		return [
+			this.migrating || this.migrationRunning ? t.migrationResume : this.step || t.syncIdle,
+			...(this.step ? [t.syncElapsed(Math.floor((Date.now() - this.stepAt) / 1000))] : []),
+			...(snap.currentFile ? [snap.currentFile] : []),
+			t.syncCounts(Object.keys(this.index.data.files).length, this.index.dirtyPaths().length,
+				this.index.data.incoming?.length ?? 0, this.locks.size),
+			t.syncRecovered(this.recovered),
+			...(this.lastError ? [this.lastError] : []),
+			...Object.values(this.index.data.incomingErrors ?? {}).slice(0, 8),
+		];
+	}
 
 	constructor(
 		private plugin: GdsyncPlugin,
@@ -186,7 +221,9 @@ export class SyncEngine {
 	 * content hash is authoritative so same-size edits with a preserved mtime are safe.
 	 */
 	private async reconcileLocal(): Promise<void> {
+		let checked = 0;
 		for (const file of this.plugin.app.vault.getFiles()) {
+			if (++checked % 50 === 0) await yieldToUI();
 			const rel = this.toRel(file.path);
 			if (!rel || this.isExcluded(rel)) continue;
 			const e = this.index.getFile(rel);
@@ -398,6 +435,7 @@ export class SyncEngine {
 			return;
 		}
 		this.scanning = true;
+		this.setStep(t.syncScanning);
 		try {
 			await this.queue.pause();
 			await Promise.all(Array.from(this.locks.values()));
@@ -458,11 +496,19 @@ export class SyncEngine {
 				for (const kid of kids) {
 					if (kid.trashed) continue;
 					const isFolder = kid.mimeType === FOLDER_MIME;
-					if (!isFolder) {
+					{
 						if (kid.mimeType.startsWith(GOOGLE_APPS_PREFIX)) continue;
 						if (kid.shortcutDetails) continue;
 					}
 					let name = sanitizeName(kid.name);
+					if (!isFolder) {
+						const canonical = joinPath(cur.rel, name);
+						const known = this.index.pathById(kid.id);
+						const alias = driveAliasName(name, kid.id);
+						const occupantId = isFolder ? this.index.getFolderId(canonical) : this.index.getFile(canonical)?.fileId;
+						if (known === joinPath(cur.rel, alias) || (occupantId && occupantId !== kid.id &&
+							kids.some(sibling => sibling.id === occupantId && sanitizeName(sibling.name) === name))) name = alias;
+					}
 					// Drive は同名兄弟を許すので Vault 側は連番で一意化
 					if (usedNames.has(name.toLowerCase())) {
 						const dot = name.lastIndexOf(".");
@@ -533,6 +579,7 @@ export class SyncEngine {
 						created++;
 					} else {
 						const localFile = this.ops.getFile(this.toVault(rel));
+						if (localFile && existing.fileId !== meta.id && await this.recoverEmptyStub(rel, meta)) continue;
 						if (!localFile) {
 							if (existing.dirty) throw new Error("Missing unsent local file: " + rel);
 							// インデックスには記録があるが実体が存在しない
@@ -629,6 +676,7 @@ export class SyncEngine {
 			this.notifyError(t.scanFailed, e);
 		} finally {
 			this.scanning = false;
+			if (!this.syncing) this.step = "";
 			if (!internal) this.queue.resume();
 		}
 	}
@@ -717,6 +765,7 @@ export class SyncEngine {
 			return true;
 		} catch (e) {
 			this.pendingIssues.add(expectedPath);
+			if (e instanceof NetworkError) { this.networkFailed = true; this.lastError = e.message; }
 			this.notifyError(t.downloadFailed(file.name), e);
 			return false;
 		} finally {
@@ -777,6 +826,7 @@ export class SyncEngine {
 			remoteModifiedTime: 0,
 			remoteSize: 0,
 			hydrated: true, // ローカル生まれ = ローカルが実体
+			localOrigin: true,
 			dirty: true,
 			syncState: "localChanged",
 			revision: 1,
@@ -955,6 +1005,12 @@ export class SyncEngine {
 			}
 			const localMd5 = md5Hex(data);
 			entry.localMd5 = localMd5;
+			if (!entry.fileId && data.byteLength === 0 && this.index.data.incoming?.some(c =>
+				c.file && num(c.file.size) > 0 && sanitizeName(c.file.name) === file.name)) {
+				this.pendingIssues.add(rel);
+				this.lastError = `${rel}: ${t.syncEmptyBlocked}`;
+				return true;
+			}
 			if (file.extension === "md" && !await this.uploadAttachments(file, new TextDecoder().decode(data))) return false;
 			if ((entry.revision ?? 0) !== revision || file.stat.mtime !== mtimeBeforeUpload) return false;
 			// ガード3: ローカルが空でリモートに内容がある場合は事故防止のため送らない
@@ -1290,6 +1346,7 @@ export class SyncEngine {
 	// ---------------- リモート差分（changes API） ----------------
 
 	async pullChanges(): Promise<void> {
+		this.networkFailed = false;
 		const token = this.index.data.changesPageToken;
 		if (!token) return; // フルスキャン前
 		let result;
@@ -1303,6 +1360,8 @@ export class SyncEngine {
 			}
 			throw e;
 		}
+		this.parentMetas.clear();
+		this.parentPaths.clear();
 		const latest = new Map<string, DriveChange>();
 		for (const c of [...(this.index.data.incoming ?? []), ...result.changes]) latest.set(c.fileId, c);
 		this.index.data.incoming = Array.from(latest.values());
@@ -1311,11 +1370,24 @@ export class SyncEngine {
 		await this.index.flush(); // Durable receipt BEFORE advancing through application.
 		const changes = [...this.index.data.incoming].sort((a, b) =>
 			Number(b.file?.mimeType === FOLDER_MIME) - Number(a.file?.mimeType === FOLDER_MIME));
+		for (const c of changes) if (c.file?.mimeType === FOLDER_MIME && !c.removed && !c.file.trashed)
+			this.parentMetas.set(c.fileId, Promise.resolve(c.file));
+		const errors = this.index.data.incomingErrors ?? (this.index.data.incomingErrors = {});
+		const retained = new Set(changes.map(c => c.fileId));
+		for (const id of Object.keys(errors)) if (!retained.has(id)) delete errors[id];
+		let n = 0;
 		for (const c of changes) {
+			this.setStep(t.syncApplying(++n, changes.length, c.file?.name ?? c.fileId));
 			try {
 				await this.applyChange(c);
 				this.index.data.incoming = this.index.data.incoming!.filter((item) => item !== c);
-			} catch (e) { console.error('gdsync: incoming change retained', c.fileId, e); }
+				delete errors[c.fileId];
+			} catch (e) {
+				errors[c.fileId] = `${c.file?.name ?? c.fileId}: ${e instanceof Error ? e.message : String(e)}`;
+				console.error('gdsync: incoming change retained', c.fileId, e);
+				if (e instanceof NetworkError || this.networkFailed) break;
+			}
+			if (n % 25 === 0) { this.index.markDirty(); await this.index.flush(); await yieldToUI(); }
 		}
 		this.index.markDirty();
 		await this.index.flush();
@@ -1330,22 +1402,88 @@ export class SyncEngine {
 		if (known !== undefined && this.index.getFolderId(known) !== undefined) return known;
 		if (visited.has(pid)) throw new Error('Cyclic Drive ancestry');
 		visited.add(pid);
-		const parent = await this.drive.getMeta(pid);
+		if (this.parentPaths.has(pid)) return this.parentPaths.get(pid);
+		let request = this.parentMetas.get(pid);
+		if (!request) { request = this.drive.getMeta(pid); this.parentMetas.set(pid, request); }
+		const parent = await request;
 		const ancestor = await this.parentPathOf(parent, visited);
-		if (ancestor === undefined) return undefined;
-		const rel = joinPath(ancestor, sanitizeName(parent.name));
-		if (this.isExcluded(rel)) throw new Error('Excluded ancestor');
+		if (ancestor === undefined) { this.parentPaths.set(pid, undefined); return undefined; }
+		let rel = joinPath(ancestor, sanitizeName(parent.name));
+		if (this.isExcluded(rel)) { this.parentPaths.set(pid, undefined); return undefined; }
 		const occupied = this.index.getFolderId(rel);
-		if (occupied && occupied !== pid) throw new Error('Folder path collision: ' + rel);
+		if (occupied && occupied !== pid) rel = joinPath(ancestor, driveAliasName(sanitizeName(parent.name), pid));
+		if (this.index.getFolderId(rel) && this.index.getFolderId(rel) !== pid) throw new Error('Folder path collision: ' + rel);
 		await this.ops.ensureFolder(this.toVault(rel));
 		this.index.setFolder(rel, pid);
+		this.parentPaths.set(pid, rel);
 		return rel;
+	}
+
+	/** Restore only unchanged legacy empty orphans, after a durable local backup. */
+	private async recoverEmptyStub(rel: string, meta: DriveItemMeta): Promise<boolean> {
+		const entry = this.index.getFile(rel);
+		if (!entry || entry.fileId || entry.creationId || entry.localOrigin || entry.recoveryOnly ||
+			!entry.dirty || entry.syncState !== "localChanged" || entry.revision !== 1 ||
+			entry.localSize !== 0 || entry.localMd5 !== md5Hex(new ArrayBuffer(0)) ||
+			entry.hydratedMd5 !== undefined || (num(meta.size) === 0 && meta.md5Checksum !== entry.localMd5)) return false;
+		return this.withLock(rel, async () => {
+			const file = this.ops.getFile(this.toVault(rel));
+			if (!file || this.index.getFile(rel) !== entry || entry.fileId || entry.revision !== 1) return false;
+			const mtime = file.stat.mtime;
+			const data = await this.ops.readBinary(file);
+			if (data.byteLength !== 0) return false;
+			const adapter = this.plugin.app.vault.adapter;
+			const dir = `${this.plugin.manifest.dir}/stub-recovery`;
+			if (!await adapter.exists(dir)) await adapter.mkdir(dir);
+			const backup = `${dir}/${meta.id.replace(/[^a-zA-Z0-9_-]/g, "_")}`;
+			if (!await adapter.exists(backup + ".json")) {
+				await adapter.writeBinary(backup + ".bin", data);
+				await adapter.write(backup + ".json", JSON.stringify({ rel, entry, remote: meta }));
+			}
+			const saved = JSON.parse(await adapter.read(backup + ".json"));
+			if (saved.rel !== rel || saved.remote.id !== meta.id ||
+				md5Hex(await adapter.readBinary(backup + ".bin")) !== md5Hex(data)) throw new Error(`Invalid recovery backup: ${rel}`);
+			if (file.stat.mtime !== mtime || entry.revision !== 1 || entry.fileId ||
+				(await this.ops.readBinary(file)).byteLength !== 0) return false;
+			entry.fileId = meta.id;
+			entry.remoteMd5 = meta.md5Checksum ?? null;
+			entry.remoteSize = num(meta.size);
+			entry.remoteModifiedTime = ts(meta.modifiedTime);
+			entry.hydrated = false;
+			entry.dirty = false;
+			entry.syncState = "clean";
+			entry.recoveryPending = true;
+			this.index.setFile(rel, entry);
+			await this.index.flush();
+			this.recovered++;
+			if (entry.remoteSize === 0) {
+				entry.hydrated = true;
+				entry.hydratedMd5 = entry.remoteMd5 ?? undefined;
+				entry.recoveryPending = false;
+				this.index.markDirty();
+				await this.index.flush();
+				return true;
+			}
+			if (entry.remoteSize > this.plugin.settings.maxFileSizeMB * 1024 * 1024) {
+				entry.tooLarge = true;
+				entry.recoveryPending = false;
+				this.index.markDirty();
+				await this.index.flush();
+				return true;
+			}
+			if (!await this.downloadInto(file, entry)) throw new Error(`Recovery download deferred: ${rel}`);
+			entry.recoveryPending = false;
+			this.index.markDirty();
+			await this.index.flush();
+			return true;
+		});
 	}
 
 	private async applyChange(c: DriveChange): Promise<void> {
 		if (this.index.data.pendingOps.some((op) => op.fileId === c.fileId)) throw new Error("Local structure change is pending");
 		const knownPath = this.index.pathById(c.fileId);
 		const meta = c.file;
+		if (knownPath !== undefined && this.isExcluded(knownPath)) return;
 
 		// ルートフォルダ自体の削除は無視（誤爆防止）
 		if (c.fileId === this.plugin.settings.rootFolderId) return;
@@ -1380,8 +1518,11 @@ export class SyncEngine {
 				}
 			} else {
 				if (parentPath === undefined) return; // ツリー外
-				const rel = joinPath(parentPath, sanitizeName(meta.name));
+				let rel = joinPath(parentPath, sanitizeName(meta.name));
 				if (this.isExcluded(rel)) return;
+				const occupied = this.index.getFolderId(rel);
+				if (occupied && occupied !== meta.id) rel = joinPath(parentPath, driveAliasName(sanitizeName(meta.name), meta.id));
+				if (this.index.getFolderId(rel) && this.index.getFolderId(rel) !== meta.id) throw new Error('Folder path collision: ' + rel);
 				await this.ops.ensureFolder(this.toVault(rel));
 				this.index.setFolder(rel, meta.id);
 				this.status.remoteChange("added");
@@ -1420,6 +1561,14 @@ export class SyncEngine {
 			entry.tooLarge =
 				num(meta.size) > this.plugin.settings.maxFileSizeMB * 1024 * 1024;
 			this.index.markDirty();
+			if (entry.recoveryPending) {
+				await this.withLock(rel, async () => {
+					const f = this.ops.getFile(this.toVault(rel));
+					if (!f || entry.dirty || !await this.downloadInto(f, entry)) throw new Error(`Recovery download deferred: ${rel}`);
+					entry.recoveryPending = false;
+					this.index.markDirty();
+				});
+			}
 			if (
 				entry.hydrated &&
 				!entry.dirty &&
@@ -1429,18 +1578,21 @@ export class SyncEngine {
 				await this.withLock(rel, async () => {
 					const f = this.ops.getFile(this.toVault(rel));
 					if (!f || entry.dirty) return;
-					if (this.isFileOpen(rel) || this.isEager(rel)) {
-						// 開いているファイル・eager 指定は即時更新して実体を保つ
-						if (!await this.downloadInto(f, entry)) throw new Error(`Download deferred: ${rel}`);
-					}
+					// A cached body must not remain stale for plugins reading it without file-open.
+					if (!await this.downloadInto(f, entry)) throw new Error(`Download deferred: ${rel}`);
 				});
 			}
 			if (changed) this.status.remoteChange("updated");
 		} else {
 			if (parentPath === undefined) return;
-			const rel = joinPath(parentPath, sanitizeName(meta.name));
+			let rel = joinPath(parentPath, sanitizeName(meta.name));
 			if (this.isExcluded(rel)) return;
-			if (this.index.getFile(rel)) throw new Error('File path collision: ' + rel);
+			const occupied = this.index.getFile(rel);
+			if (occupied?.fileId && occupied.fileId !== meta.id) rel = joinPath(parentPath, driveAliasName(sanitizeName(meta.name), meta.id));
+			if (this.index.getFile(rel)) {
+				if (await this.recoverEmptyStub(rel, meta)) { this.status.remoteChange("updated"); return; }
+				throw new Error('File path collision: ' + rel);
+			}
 			if (this.ops.exists(this.toVault(rel))) throw new Error('Untracked local file: ' + rel);
 			await this.ops.createStub(this.toVault(rel));
 			this.index.setFile(rel, {
@@ -1525,24 +1677,30 @@ export class SyncEngine {
 	 */
 	async syncNow(opts?: { awaitUploads?: boolean; notify?: boolean }): Promise<void> {
 		if (this.scanning || this.syncing || this.migrating || this.migrationRunning) {
-			if (opts?.notify) new Notice(t.syncAlreadyRunning);
+			if (opts?.notify) new Notice(this.getDiagnostics().join("\n"), 12000);
 			return;
 		}
 		this.syncing = true;
 		this.pendingIssues.clear();
-		this.status.beginSync();
 		let failed = false;
 		try {
+			this.status.beginSync();
 			this.assertTarget();
+			this.lastError = "";
+			this.setStep(t.syncWaiting);
 			await this.queue.pause();
 			await Promise.all(Array.from(this.locks.values()));
 			if (this.opsTask) await this.opsTask;
 			if (!this.index.data.changesPageToken) await this.fullScan(true);
 			if (!this.index.data.changesPageToken) throw new Error(t.syncNotReady);
+			this.setStep(t.syncReconciling);
 			await this.reconcileLocal();
+			this.setStep(t.syncSending);
 			await this.flushPendingOps();
 			await this.tryEnsureRemoteFolders();
+			this.setStep(t.syncReceiving);
 			await this.pullChanges();
+			if (this.networkFailed) throw new NetworkError(this.lastError);
 			this.openAttachments.clear();
 			const openNotes: TFile[] = [];
 			this.plugin.app.workspace.iterateAllLeaves((leaf) => {
@@ -1550,16 +1708,21 @@ export class SyncEngine {
 			});
 			for (const file of openNotes) await this.hydrateEmbedsOf(file);
 			this.queue.resume();
+			this.setStep(t.syncSending);
 			// Attachments first. A second phase reads current notes only after that attempt.
 			await this.queue.runNow(this.index.dirtyPaths().filter((rel) => !rel.endsWith(".md")));
 			await this.queue.runNow(this.index.dirtyPaths().filter((rel) => rel.endsWith(".md")));
 			await this.flushPendingOps();
+			this.setStep(t.syncSaving);
 			await this.index.flush();
 		} catch (e) {
 			failed = true;
+			this.lastError = e instanceof Error ? e.message : String(e);
 			if (e instanceof NetworkError) this.status.setOffline();
 			else this.notifyError(t.syncFailed, e);
 		} finally {
+			this.syncing = false;
+			this.step = "";
 			this.queue.resume();
 			const pending = this.index.dirtyPaths().length;
 			const ops = this.index.data.pendingOps.length + Object.values(this.index.data.folders).filter(id => !id).length;

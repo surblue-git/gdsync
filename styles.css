@@ -19,3 +19,7 @@
 .gdsync-folder-desc {
 	overflow-wrap: anywhere;
 }
+.gdsync-sync-details {
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+}

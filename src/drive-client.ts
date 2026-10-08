@@ -2,6 +2,7 @@ import { requestUrl, RequestUrlParam, RequestUrlResponse } from "obsidian";
 import { AuthManager } from "./auth";
 import { t } from "./i18n";
 import { DriveChange, DriveItemMeta } from "./types";
+import { readWithTimeout } from "./request-timeout";
 
 const API = "https://www.googleapis.com/drive/v3";
 const UPLOAD_API = "https://www.googleapis.com/upload/drive/v3";
@@ -86,7 +87,9 @@ export class DriveClient {
 				Authorization: `Bearer ${token}`,
 			};
 			try {
-				return await requestUrl({ ...params, headers, throw: false });
+				const request = requestUrl({ ...params, headers, throw: false });
+				return await ((!params.method || params.method === "GET")
+					? readWithTimeout(request, "Google Drive") : request);
 			} catch (e) {
 				throw new NetworkError(
 					t.networkError(e instanceof Error ? e.message : String(e))

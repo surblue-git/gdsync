@@ -146,6 +146,10 @@ export interface IndexEntry {
 	syncState?: "clean" | "localChanged" | "conflict" | "unknown";
 	/** A local recovery artifact that must never be uploaded automatically. */
 	recoveryOnly?: boolean;
+	/** An empty legacy orphan was backed up and reattached; fetch its remote bytes. */
+	recoveryPending?: boolean;
+	/** New local files created by this version must not be mistaken for legacy stubs. */
+	localOrigin?: boolean;
 	/** Persisted before creating a remote file, for idempotent retry. */
 	creationId?: string;
 	conflictCopy?: { rel: string; creationId: string; revision: number; remoteRel?: string };
@@ -177,6 +181,8 @@ export interface GdsyncIndex {
 	mountBase?: string;
 	/** Durable changes received but not yet applied. */
 	incoming?: DriveChange[];
+	/** Last application error per retained change, readable on mobile. */
+	incomingErrors?: Record<string, string>;
 	folderCreationIds?: Record<string, string>;
 	/** key = ベースフォルダ相対の normalizePath 済みパス */
 	files: Record<string, IndexEntry>;

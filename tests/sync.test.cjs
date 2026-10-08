@@ -42,6 +42,17 @@ function text(file) { return new TextDecoder().decode(file.data); }
 function deferred() { let resolve, reject; const promise = new Promise((a, b) => { resolve = a; reject = b; }); return { promise, resolve, reject }; }
 const tick = () => new Promise((resolve) => setTimeout(resolve, 10));
 
+function legacyEmpty(f, rel) {
+	return f.track(rel, { fileId: '', dirty: true, hydrated: true, syncState: 'localChanged', revision: 1,
+		remoteMd5: null, remoteSize: 0, hydratedMd5: undefined,
+		localMd5: 'd41d8cd98f00b204e9800998ecf8427e', localSize: 0 });
+}
+
+function remoteChange(rel = 'a.md', extra = {}) {
+	return { fileId: 'remote-' + rel, removed: false, file: { id: 'remote-' + rel, name: rel,
+		mimeType: 'text/markdown', parents: ['root'], size: '6', md5Checksum: 'remote-hash', ...extra } };
+}
+
 async function fixture(initial = {}, mode = 'subfolder') {
 	const files = new Map(); const disk = new Map(); let plugin;
 	const folder = (p) => {
@@ -131,6 +142,136 @@ test('root and subfolder paths reject traversal; connection codes do not remount
 	const target = { ...DEFAULT_SETTINGS, rootFolderId: 'existing' };
 	applySharedSettings(target, { rootFolderId: 'other', baseFolder: 'other' });
 	assert.equal(target.rootFolderId, 'existing'); assert.equal(target.baseFolder, 'GDrive');
+});
+
+test('legacy empty orphan is backed up and restored from Drive without uploading an empty duplicate', async () => {
+	const f = await fixture({ 'GDrive/a.md': '' }); legacyEmpty(f, 'a.md');
+	const change = remoteChange(); let uploads = 0;
+	f.drive.upload = async () => { uploads++; throw Error('Must not send'); };
+	f.drive.listChanges = async () => ({ changes: [change], newStartPageToken: 'next' });
+	await f.engine.syncNow({ notify: true });
+	assert.equal(text(f.files.get('GDrive/a.md')), 'remote');
+	assert.equal(f.index.getFile('a.md').fileId, change.fileId);
+	assert.equal(f.index.dirtyPaths().length, 0); assert.equal(f.index.data.incoming.length, 0);
+	assert.equal(uploads, 0); assert.ok(f.status.getSnapshot().lastSuccessAt);
+	const backup = JSON.parse(f.disk.get('.obsidian/plugins/gdsync/stub-recovery/remote-a_md.json'));
+	assert.equal(backup.entry.fileId, ''); assert.equal(backup.entry.dirty, true);
+	assert.equal(f.disk.get('.obsidian/plugins/gdsync/stub-recovery/remote-a_md.bin').byteLength, 0); f.close();
+});
+
+test('intentional local empty files and nonempty local edits are not silently adopted', async () => {
+	for (const [data, localOrigin] of [['', true], ['user content', false]]) {
+		const f = await fixture({ 'GDrive/a.md': data }); const e = legacyEmpty(f, 'a.md'); e.localOrigin = localOrigin;
+		await assert.rejects(f.engine.applyChange(remoteChange()), /File path collision/);
+		assert.equal(text(f.files.get('GDrive/a.md')), data); assert.equal(e.fileId, ''); f.close();
+	}
+});
+
+test('recovery refuses to mutate identity when its backup fails', async () => {
+	const f = await fixture({ 'GDrive/a.md': '' }); const e = legacyEmpty(f, 'a.md');
+	f.app.vault.adapter.writeBinary = async () => { throw Error('disk full'); };
+	await assert.rejects(f.engine.applyChange(remoteChange()), /disk full/);
+	assert.equal(e.fileId, ''); assert.equal(e.dirty, true); assert.equal(text(f.files.get('GDrive/a.md')), ''); f.close();
+});
+
+test('recovery keeps edits arriving during download and retains the incoming change', async () => {
+	const f = await fixture({ 'GDrive/a.md': '' }); const e = legacyEmpty(f, 'a.md');
+	f.drive.listChanges = async () => ({ changes: [remoteChange()], newStartPageToken: 'next' });
+	f.drive.download = async () => { await f.app.vault.modifyBinary(f.files.get('GDrive/a.md'), bytes('new edit')); return bytes('remote'); };
+	await f.engine.pullChanges();
+	assert.equal(text(f.files.get('GDrive/a.md')), 'new edit'); assert.equal(e.dirty, true);
+	assert.equal(f.index.data.incoming.length, 1); assert.match(f.engine.getDiagnostics().join(' '), /Recovery download deferred/); f.close();
+});
+
+test('a failed recovery download can resume after reloading the saved checkpoint', async () => {
+	const f = await fixture({ 'GDrive/a.md': '' }); legacyEmpty(f, 'a.md');
+	f.drive.listChanges = async () => ({ changes: [remoteChange()], newStartPageToken: 'next' });
+	f.drive.download = async () => { throw Error('offline'); };
+	await f.engine.pullChanges();
+	assert.equal(f.index.getFile('a.md').recoveryPending, true);
+	f.index.data = JSON.parse(f.disk.get('.obsidian/plugins/gdsync/index.json')); f.index.rebuildReverseMap();
+	f.drive.download = async () => bytes('remote'); await f.engine.pullChanges();
+	assert.equal(text(f.files.get('GDrive/a.md')), 'remote'); assert.equal(f.index.getFile('a.md').recoveryPending, false);
+	assert.equal(f.index.data.incoming.length, 0); f.close();
+});
+
+test('excluded ancestry is skipped and its shared metadata is fetched only once per cycle', async () => {
+	const f = await fixture(); let reads = 0;
+	f.drive.getMeta = async id => { reads++; return { id, name: '.obsidian', parents: ['root'], mimeType: 'application/vnd.google-apps.folder' }; };
+	f.drive.listChanges = async () => ({ changes: Array.from({ length: 60 }, (_, i) => remoteChange('plugin' + i + '.js', { parents: ['hidden'] })), newStartPageToken: 'next' });
+	await f.engine.syncNow(); assert.equal(reads, 1); assert.equal(f.index.data.incoming.length, 0);
+	assert.equal(Object.keys(f.index.data.files).length, 0); f.close();
+});
+
+test('busy manual sync reports its current wait and completion releases the flag', async () => {
+	const f = await fixture(); const hold = deferred(); f.drive.listChanges = async () => { await hold.promise; return { changes: [], newStartPageToken: 'next' }; };
+	const task = f.engine.syncNow(); await tick();
+	await f.engine.syncNow({ notify: true }); assert.match(notices.at(-1), /Fetching Drive changes/);
+	hold.resolve(); await task; assert.equal(f.engine.isBusy(), false); assert.equal(f.engine.getDiagnostics()[0], 'Idle'); f.close();
+});
+
+test('sync refreshes cached plugin ledgers even when they are not open or configured eager', async () => {
+	const f = await fixture({ 'GDrive/projects.json': 'old ledger' });
+	const baseline = require('../src/content-md5.ts').md5Hex(bytes('old ledger'));
+	const e = f.track('projects.json', { hydratedMd5: baseline, remoteMd5: baseline });
+	f.drive.listChanges = async () => ({ changes: [{ ...remoteChange('projects.json', { mimeType: 'application/json' }), fileId: e.fileId }], newStartPageToken: 'next' });
+	f.drive.download = async () => bytes('new ledger'); await f.engine.syncNow();
+	assert.equal(text(f.files.get('GDrive/projects.json')), 'new ledger'); assert.equal(e.dirty, false);
+	assert.equal(f.index.data.incoming.length, 0); f.close();
+});
+
+test('offline recovery stops the batch and preserves all unprocessed changes for another attempt', async () => {
+	const f = await fixture({ 'GDrive/a.md': '', 'GDrive/b.md': '' }); legacyEmpty(f, 'a.md'); legacyEmpty(f, 'b.md');
+	f.drive.listChanges = async () => ({ changes: [remoteChange('a.md'), remoteChange('b.md')], newStartPageToken: 'next' });
+	let attempts = 0; f.drive.download = async () => { attempts++; throw new (require('../src/drive-client.ts').NetworkError)('offline'); };
+	await f.engine.syncNow(); assert.equal(attempts, 1); assert.equal(f.index.data.incoming.length, 2);
+	assert.equal(f.status.getSnapshot().lastSuccessAt, undefined); assert.equal(f.engine.isBusy(), false); f.close();
+});
+
+test('full scan restores legacy orphans as well as incremental changes', async () => {
+	const f = await fixture({ 'GDrive/a.md': '' }); legacyEmpty(f, 'a.md');
+	f.drive.listAll = async () => [remoteChange().file]; await f.engine.fullScan();
+	assert.equal(text(f.files.get('GDrive/a.md')), 'remote'); assert.equal(f.index.getFile('a.md').dirty, false); f.close();
+});
+
+test('distinct Drive files with the same name survive incremental sync and a later full scan', async () => {
+	const f = await fixture({ 'GDrive/a.md': '' }); legacyEmpty(f, 'a.md');
+	const first = remoteChange(); const second = { ...remoteChange(), fileId: 'other', file: { ...remoteChange().file, id: 'other' } };
+	f.drive.listChanges = async () => ({ changes: [first, second], newStartPageToken: 'next' });
+	await f.engine.syncNow();
+	assert.equal(f.index.data.incoming.length, 0);
+	assert.equal(f.index.pathById('remote-a.md'), 'a.md'); assert.equal(f.index.pathById('other'), 'a (Drive other).md');
+	f.drive.listAll = async () => [first.file, second.file]; await f.engine.fullScan();
+	assert.equal(f.index.pathById('remote-a.md'), 'a.md'); assert.equal(f.index.pathById('other'), 'a (Drive other).md'); f.close();
+});
+
+test('same-name Drive folders retain separate children and identities', async () => {
+	const f = await fixture(); const folder = id => ({ id, name: 'images', mimeType: 'application/vnd.google-apps.folder', parents: ['root'] });
+	f.drive.listChanges = async () => ({ changes: ['one', 'two'].map(id => ({ fileId: id, file: folder(id), removed: false })).concat([
+		remoteChange('p.png', { parents: ['one'] }), { ...remoteChange('q.png', { parents: ['two'] }) }
+	]), newStartPageToken: 'next' });
+	await f.engine.syncNow(); assert.equal(f.index.data.incoming.length, 0);
+	assert.equal(f.index.pathById('one'), 'images'); assert.equal(f.index.pathById('two'), 'images (Drive two)');
+	assert.ok(f.index.getFile('images/p.png')); assert.ok(f.index.getFile('images (Drive two)/q.png')); f.close();
+});
+
+test('an unchanged legacy empty file can acknowledge an identical empty Drive file without downloading or uploading', async () => {
+	const f = await fixture({ 'GDrive/a.md': '' }); legacyEmpty(f, 'a.md');
+	f.drive.download = async () => { throw Error('Must not download'); };
+	await f.engine.applyChange(remoteChange('a.md', { size: '0', md5Checksum: 'd41d8cd98f00b204e9800998ecf8427e' }));
+	assert.equal(f.index.getFile('a.md').fileId, 'remote-a.md'); assert.equal(f.index.getFile('a.md').dirty, false);
+	assert.equal(text(f.files.get('GDrive/a.md')), ''); f.close();
+});
+
+test('timed-out reads reject without applying late results; write requests retain their lock until completion', async () => {
+	const { readWithTimeout } = require('../src/request-timeout.ts'); const hold = deferred();
+	let applied = false; const task = readWithTimeout(hold.promise, 'read', 5).then(() => { applied = true; });
+	await assert.rejects(task, /timed out/); hold.resolve('late'); await tick(); assert.equal(applied, false);
+	const { DriveClient } = require('../src/drive-client.ts'); const write = deferred(); let finished = false;
+	obsidian.requestUrl = async () => write.promise;
+	const client = new DriveClient({ getAccessToken: async () => 'test' });
+	const upload = client.upload({ fileId: 'existing', mimeType: 'image/png', data: bytes('data') }).then(() => { finished = true; });
+	await tick(); assert.equal(finished, false); write.resolve({ status: 200, json: { id: 'existing' } }); await upload;
 });
 
 test('drain waits for a new attempt of a previously completed path', async () => {
