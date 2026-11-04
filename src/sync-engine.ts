@@ -114,13 +114,16 @@ export class SyncEngine {
 
 	getDiagnostics(): string[] {
 		const snap = this.status.getSnapshot();
+		const dirty = this.index.dirtyPaths();
+		const conflicts = dirty.filter(path => this.index.getFile(path)?.syncState === "conflict");
 		return [
 			this.migrating || this.migrationRunning ? t.migrationResume : this.step || t.syncIdle,
 			...(this.step ? [t.syncElapsed(Math.floor((Date.now() - this.stepAt) / 1000))] : []),
 			...(snap.currentFile ? [snap.currentFile] : []),
-			t.syncCounts(Object.keys(this.index.data.files).length, this.index.dirtyPaths().length,
+			t.syncCounts(Object.keys(this.index.data.files).length, dirty.length,
 				this.index.data.incoming?.length ?? 0, this.locks.size),
 			t.syncRecovered(this.recovered),
+			...(conflicts.length ? [t.syncConflictDetails(conflicts.length), ...conflicts.slice(0, 8)] : []),
 			...(this.lastError ? [this.lastError] : []),
 			...Object.values(this.index.data.incomingErrors ?? {}).slice(0, 8),
 		];
@@ -235,6 +238,9 @@ export class SyncEngine {
 			}
 
 			const localMd5 = md5Hex(await this.ops.readBinary(file));
+			if (e.hydrated && e.syncState === "clean" && !e.dirty && e.fileId &&
+				localMd5 === e.hydratedMd5 && localMd5 === e.localMd5 &&
+				e.localMtime === file.stat.mtime && e.localSize === file.stat.size) continue;
 			const previousObserved = e.localMd5 ?? e.hydratedMd5;
 			const changedSinceObservation = previousObserved !== undefined && previousObserved !== localMd5;
 			e.hydrated = true;
@@ -988,10 +994,7 @@ export class SyncEngine {
 			const entry = this.index.getFile(rel);
 			if (!entry || !entry.dirty) return true;
 			if (entry.recoveryOnly) return true;
-			if (entry.syncState === "conflict") {
-				this.pendingIssues.add(rel);
-				return true;
-			}
+			if (entry.syncState === "conflict") return this.recheckConflict(rel, entry);
 			if (!entry.hydrated) return true; // ガード2: 実体なしは絶対に送らない
 			const file = this.ops.getFile(this.toVault(rel));
 			if (!file) return true; // 既に消えていた
@@ -1149,6 +1152,43 @@ export class SyncEngine {
 				this.status.uploadFinished(transfer, ok);
 			}
 		});
+	}
+
+	/** A conflict can be acknowledged without replacing either version if the bytes now agree. */
+	private async recheckConflict(rel: string, entry: IndexEntry): Promise<boolean> {
+		const file = this.ops.getFile(this.toVault(rel));
+		const fileId = entry.fileId;
+		if (file && fileId && entry.hydrated) {
+			const revision = entry.revision;
+			const mtime = file.stat.mtime;
+			let remote: DriveItemMeta | undefined;
+			try {
+				remote = await this.drive.getMeta(fileId, "md5Checksum,modifiedTime,size,trashed");
+			} catch (error) {
+				this.lastError = `${rel}: ${error instanceof Error ? error.message : String(error)}`;
+			}
+			if (remote?.md5Checksum && !remote.trashed &&
+				md5Hex(await this.ops.readBinary(file)) === remote.md5Checksum) {
+				this.assertTarget();
+				if (this.index.getFile(rel) === entry && this.ops.getFile(this.toVault(rel)) === file &&
+					entry.fileId === fileId && entry.syncState === "conflict" &&
+					entry.revision === revision && file.stat.mtime === mtime && !this.isExcluded(rel)) {
+					entry.localMd5 = entry.remoteMd5 = entry.hydratedMd5 = remote.md5Checksum;
+					entry.remoteModifiedTime = ts(remote.modifiedTime);
+					entry.remoteSize = num(remote.size);
+					entry.dirty = false;
+					entry.syncState = "clean";
+					entry.conflictCopy = undefined;
+					this.rememberLocal(file, entry);
+					this.pendingIssues.delete(rel);
+					this.index.markDirty();
+					await this.index.flush();
+					return true;
+				}
+			}
+		}
+		this.pendingIssues.add(rel);
+		return true;
 	}
 
 	/**
@@ -1360,6 +1400,8 @@ export class SyncEngine {
 			}
 			throw e;
 		}
+		if (result.newStartPageToken === token && !result.changes.length &&
+			!this.index.data.incoming?.length && !Object.keys(this.index.data.incomingErrors ?? {}).length) return;
 		this.parentMetas.clear();
 		this.parentPaths.clear();
 		const latest = new Map<string, DriveChange>();

@@ -16,6 +16,7 @@ export class FileIndex {
 	private saveTimer: number | null = null;
 	private pendingSave = false;
 	private saving: Promise<void> = Promise.resolve();
+	private savedSnapshot: string | undefined;
 	ready = false;
 
 	constructor(private plugin: GdsyncPlugin) { }
@@ -39,6 +40,7 @@ export class FileIndex {
 			if (await adapter.exists(this.filePath)) {
 				const raw = await adapter.read(this.filePath);
 				this.data = parse(raw);
+				if (!this.pendingSave) this.savedSnapshot = JSON.stringify(this.data);
 			} else if (await adapter.exists(this.filePath + ".tmp") || await adapter.exists(this.filePath + ".bak")) {
 				throw new Error("Missing checkpoint");
 			}
@@ -93,6 +95,7 @@ export class FileIndex {
 		}
 		const snapshot = JSON.stringify(this.data);
 		const write = this.saving.catch(() => undefined).then(async () => {
+			if (snapshot === this.savedSnapshot) return;
 			const adapter = this.plugin.app.vault.adapter;
 			// The old checkpoint survives a failed or interrupted replacement.
 			if (await adapter.exists(this.filePath)) {
@@ -101,7 +104,10 @@ export class FileIndex {
 				await adapter.write(this.filePath + ".bak", previous);
 			}
 			await adapter.write(this.filePath + ".tmp", snapshot);
+			// A failed replacement may already have modified the checkpoint.
+			this.savedSnapshot = undefined;
 			await adapter.write(this.filePath, snapshot);
+			this.savedSnapshot = snapshot;
 		});
 		this.saving = write;
 		try { await write; }

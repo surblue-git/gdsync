@@ -53,6 +53,19 @@ function remoteChange(rel = 'a.md', extra = {}) {
 		mimeType: 'text/markdown', parents: ['root'], size: '6', md5Checksum: 'remote-hash', ...extra } };
 }
 
+function recoveryDrive(f, contents) {
+	const hash = require('../src/content-md5.ts').md5Hex;
+	const metadata = new Map(Object.entries(contents).map(([rel, data]) => ['id-' + rel, {
+		id: 'id-' + rel, name: rel.split('/').pop(), mimeType: 'application/octet-stream', parents: ['root'],
+		size: String(bytes(data).byteLength), md5Checksum: hash(bytes(data)), modifiedTime: '2026-10-20T00:00:00Z',
+	}]));
+	const writes = [];
+	f.drive.getMeta = async id => { if (!metadata.has(id)) throw Error('not found'); return { ...metadata.get(id) }; };
+	f.drive.download = async id => bytes(contents[id.slice(3)]);
+	for (const name of ['upload', 'trash', 'patchMeta', 'createFolder']) f.drive[name] = async () => { writes.push(name); throw Error('unexpected remote write'); };
+	return { metadata, writes };
+}
+
 async function fixture(initial = {}, mode = 'subfolder') {
 	const files = new Map(); const disk = new Map(); let plugin;
 	const folder = (p) => {
@@ -132,6 +145,52 @@ async function fixture(initial = {}, mode = 'subfolder') {
 	};
 	return { ...plugin, plugin, files, disk, drive, track, put, close: () => plugin.engine.queue.clear() };
 }
+
+test('ordinary sync clears only conflicts with matching content and reports the remaining paths', async () => {
+	const f = await fixture({ 'GDrive/matching.md': 'same', 'GDrive/different.md': 'mine' });
+	f.track('matching.md', { dirty: true, syncState: 'conflict' });
+	f.track('different.md', { dirty: true, syncState: 'conflict' });
+	const drive = recoveryDrive(f, { 'matching.md': 'same', 'different.md': 'them' });
+	await f.engine.syncNow();
+	assert.deepEqual(f.index.dirtyPaths(), ['different.md']);
+	assert.equal(f.index.getFile('matching.md').syncState, 'clean');
+	assert.equal(text(f.files.get('GDrive/different.md')), 'mine');
+	assert.deepEqual(drive.writes, []);
+	assert.ok(f.engine.getDiagnostics().includes('different.md'));
+	f.close();
+});
+
+test('conflict recheck retains an edit made while Drive metadata is loading', async () => {
+	const f = await fixture({ 'GDrive/a.md': 'same' });
+	const entry = f.track('a.md', { dirty: true, syncState: 'conflict' });
+	const { metadata } = recoveryDrive(f, { 'a.md': 'same' });
+	f.drive.getMeta = async id => {
+		await f.plugin.app.vault.modifyBinary(f.files.get('GDrive/a.md'), bytes('same'));
+		return metadata.get(id);
+	};
+	await f.engine.performUpload('a.md');
+	assert.equal(entry.dirty, true);
+	assert.equal(entry.syncState, 'conflict');
+	f.close();
+});
+
+test('a repeated unchanged sync does not rewrite the index checkpoint', async () => {
+	const f = await fixture({ 'GDrive/a.md': 'same' });
+	const hash = require('../src/content-md5.ts').md5Hex(bytes('same'));
+	f.track('a.md', { hydratedMd5: hash, remoteMd5: hash });
+	await f.engine.syncNow();
+	const writes = [];
+	const adapter = f.plugin.app.vault.adapter;
+	const write = adapter.write;
+	adapter.write = async (path, data) => { writes.push(path); await write(path, data); };
+	await f.engine.syncNow();
+	assert.deepEqual(writes, []);
+	f.index.data.changesPageToken = 'different';
+	f.index.markDirty();
+	await f.index.flush();
+	assert.ok(writes.some(path => path.endsWith('/index.json')));
+	f.close();
+});
 
 test('root and subfolder paths reject traversal; connection codes do not remount existing targets', () => {
 	assert.equal(paths.vaultPath('', 'A/image.png'), 'A/image.png');
