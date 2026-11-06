@@ -17,6 +17,7 @@ import type GdsyncPlugin from "./main";
 import { mountBase, relativePath, vaultPath, protectedPath } from "./sync-paths";
 import { attachmentReferences, freshLinkCache, invalidateLinkCache } from "./attachment-links";
 import { MountMigration } from "./mount-migration";
+import { RootRebuild } from "./root-rebuild";
 import { md5Hex } from "./content-md5";
 
 const MIME_BY_EXT: Record<string, string> = {
@@ -216,8 +217,37 @@ export class SyncEngine {
 	}
 
 	async restoreMigrationState(): Promise<void> {
-		this.migrating = await new MountMigration(this.plugin).pending();
+		this.migrating = await new RootRebuild(this.plugin).pending() || await new MountMigration(this.plugin).pending();
 		if (this.migrating) new Notice(t.migrationResume, 15000);
+	}
+
+	/** Escape a broken sync without uploading old edits, deletes or empty stubs. */
+	async rebuildAtRoot(): Promise<string> {
+		if (!this.index.ready) throw new Error("GDSync: 同期記録の初期化を待ってから実行してください。");
+		if (this.migrationRunning) throw new Error(t.syncAlreadyRunning);
+		if (!this.plugin.settings.rootFolderId) throw new Error(t.noFolderSelected);
+		this.migrationRunning = true;
+		this.plugin.settings.syncPaused = true;
+		this.plugin.settings.syncOnStartup = false;
+		const rebuild = new RootRebuild(this.plugin);
+		try {
+			await this.plugin.saveSettings();
+			await this.queue.pause();
+			while (this.syncing || this.scanning) await new Promise(resolve => setTimeout(resolve, 25));
+			await Promise.all([...this.locks.values(), ...this.folderTasks.values()]);
+			if (this.opsTask) await this.opsTask;
+			this.migrating = true;
+			for (const path of this.index.dirtyPaths()) this.queue.cancel(path);
+			const directory = await rebuild.run();
+			this.pendingIssues.clear();
+			this.parentMetas.clear();
+			this.parentPaths.clear();
+			this.ops.suppressor.clear();
+			return directory;
+		} finally {
+			try { this.migrating = await rebuild.pending() || await new MountMigration(this.plugin).pending(); }
+			finally { this.migrationRunning = false; this.status.endProgress(); }
+		}
 	}
 
 	async migrateToRoot(): Promise<string[]> {

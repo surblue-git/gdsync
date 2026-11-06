@@ -79,6 +79,7 @@ async function fixture(initial = {}, mode = 'subfolder') {
 	const put = (p, data) => { folder(path.posix.dirname(p) === '.' ? '' : path.posix.dirname(p)); const f = new TFile(p, data); files.set(p, f); rebuild(); return f; };
 	for (const [p, data] of Object.entries(initial)) put(p, data);
 	const adapter = {
+		list: async p => ({ files: [...files.values()].filter(f => f instanceof TFile && path.posix.dirname(f.path) === p).map(f => f.path), folders: [...files.values()].filter(f => f instanceof TFolder && path.posix.dirname(f.path) === p).map(f => f.path) }),
 		exists: async p => disk.has(p), read: async p => { if (!disk.has(p)) throw Error('Missing ' + p); return disk.get(p); },
 		write: async (p, data) => { disk.set(p, data); },
 		writeBinary: async (p, data) => { disk.set(p, bytes(data)); },
@@ -87,6 +88,7 @@ async function fixture(initial = {}, mode = 'subfolder') {
 	const vault = {
 		adapter, configDir: '.obsidian',
 		getFiles: () => [...files.values()].filter(f => f instanceof TFile),
+		getAllLoadedFiles: () => [...files.values()],
 		getMarkdownFiles: () => vault.getFiles().filter(f => f.extension === 'md'),
 		getAbstractFileByPath: p => files.get(p) ?? null,
 		readBinary: async f => bytes(f.data), read: async f => text(f),
@@ -731,4 +733,118 @@ test('a paused engine can migrate existing files while keeping automatic transfe
 	assert.equal(f.settings.syncPaused, true);
 	assert.equal(text(f.files.get('a.md')), 'mine');
 	assert.equal(f.index.getFile('a.md').fileId, 'id-a.md'); f.close();
+});
+
+test('root rebuild discards stuck pending work locally and full scan creates fresh root stubs without Drive writes', async () => {
+ const f = await fixture({ 'GDrive/a.md': '', 'GDrive/image.png': 'image', 'outside.md': 'unsent', '.obsidian/keep.json': 'settings' });
+ f.track('a.md', { dirty: true, hydrated: false });
+ f.index.data.pendingOps = [{ kind: 'trashRemote', fileId: 'remote-a' }];
+ f.index.data.incoming = [remoteChange()];
+ const writes = [];
+ for (const name of ['upload', 'trash', 'patchMeta', 'createFolder', 'download']) f.drive[name] = async () => { writes.push(name); throw Error(name); };
+ f.engine.queue.schedule('a.md');
+ const backup = await f.engine.rebuildAtRoot();
+ assert.equal(f.settings.mountMode, 'vaultRoot');
+ assert.equal(f.settings.syncPaused, true);
+ assert.equal(f.settings.syncOnStartup, false);
+ assert.deepEqual(f.index.data.files, {});
+ assert.deepEqual(f.index.data.pendingOps, []);
+ assert.equal(f.index.data.incoming, undefined);
+ assert.equal(f.index.pathById('id-a.md'), undefined);
+ assert.equal(f.files.has('GDrive/a.md'), false);
+ assert.equal(f.files.has('outside.md'), false);
+ assert.equal(text(f.files.get('.obsidian/keep.json')), 'settings');
+ const j = JSON.parse(f.disk.get('.obsidian/plugins/gdsync/root-rebuild.json'));
+ assert.equal(new TextDecoder().decode(f.disk.get(`${backup}/${j.files.indexOf('outside.md')}.bin`)), 'unsent');
+ f.drive.listAll = async () => [remoteChange('a.md').file];
+ await f.engine.setPaused(false);
+ await f.engine.fullScan();
+ assert.ok(f.files.has('a.md'));
+ assert.equal(f.index.getFile('a.md').hydrated, false);
+ assert.equal(f.index.getFile('a.md').dirty, false);
+ assert.deepEqual(writes, []);
+ f.close();
+});
+
+test('root rebuild resumes after interrupted local deletion and retains configuration', async () => {
+ const f = await fixture({ 'GDrive/a.md': 'local', 'GDrive/b.md': '' });
+ f.track('a.md', { dirty: true });
+ const del = f.app.vault.delete;
+ let fail = true;
+ f.app.vault.delete = async file => { if (file.path.endsWith('b.md') && fail) { fail = false; throw Error('interrupted'); } await del(file); };
+ await assert.rejects(f.engine.rebuildAtRoot(), /interrupted/);
+ assert.equal(f.settings.syncPaused, true);
+ assert.equal(f.engine.migrating, true);
+ await f.engine.restoreMigrationState();
+ assert.equal(f.engine.migrating, true);
+ await f.engine.rebuildAtRoot();
+ assert.equal(f.engine.migrating, false);
+ assert.equal(f.settings.rootFolderId, 'root');
+ assert.deepEqual(f.settings.tokens, {});
+ f.close();
+});
+
+test('root rebuild does not delete a file when backup verification fails', async () => {
+ const f = await fixture({ 'GDrive/a.md': 'only copy' });
+ f.track('a.md', { dirty: true });
+ f.app.vault.adapter.readBinary = async () => bytes('corrupt backup');
+ await assert.rejects(f.engine.rebuildAtRoot(), /検証/);
+ assert.equal(text(f.files.get('GDrive/a.md')), 'only copy');
+ assert.equal(f.settings.mountMode, 'subfolder');
+ assert.equal(f.settings.syncPaused, true);
+ f.close();
+});
+
+test('root rebuild supersedes an interrupted conventional migration and archives files on both sides', async () => {
+ const f = await fixture({ 'GDrive/a.md': '', 'b.md': 'already moved' });
+ f.disk.set('.obsidian/plugins/gdsync/mount-migration.json', JSON.stringify({ version: 1, rootId: 'root', phase: 'moving', files: [], folders: [] }));
+ await f.engine.restoreMigrationState();
+ await f.engine.rebuildAtRoot();
+ assert.equal(f.engine.migrating, false);
+ assert.equal(await new MountMigration(f.plugin).pending(), false);
+ assert.equal(f.files.has('b.md'), false);
+ f.close();
+});
+
+test('root rebuild waits for an in-flight write to settle before resetting its index', async () => {
+ const f = await fixture({ 'GDrive/a.md': 'local' });
+ f.track('a.md', { dirty: true });
+ const started = deferred(), finish = deferred();
+ f.drive.upload = async p => { started.resolve(); await finish.promise; return { id: p.fileId, md5Checksum: 'new', size: String(p.data.byteLength) }; };
+ f.engine.queue.schedule('a.md', true);
+ await started.promise;
+ const reset = f.engine.rebuildAtRoot();
+ await tick();
+ assert.ok(f.files.has('GDrive/a.md'));
+ assert.equal(f.settings.mountMode, 'subfolder');
+ finish.resolve();
+ await reset;
+ assert.deepEqual(f.index.data.files, {});
+ assert.equal(f.settings.mountMode, 'vaultRoot');
+ f.close();
+});
+
+test('files created during rebuild can be archived by resuming the same action', async () => {
+ const f = await fixture({ 'GDrive/a.md': 'local' });
+ const del = f.app.vault.delete;
+ let added = false;
+ f.app.vault.delete = async file => { await del(file); if (!added) { added = true; f.put('late.md', 'arrived'); } };
+ await assert.rejects(f.engine.rebuildAtRoot(), /ファイルが作成/);
+ assert.equal(f.settings.syncPaused, true);
+ const directory = await f.engine.rebuildAtRoot();
+ const j = JSON.parse(f.disk.get('.obsidian/plugins/gdsync/root-rebuild.json'));
+ assert.equal(new TextDecoder().decode(f.disk.get(`${directory}/${j.files.indexOf('late.md')}.bin`)), 'arrived');
+ assert.equal(f.files.has('late.md'), false);
+ f.close();
+});
+
+test('root rebuild preserves hidden folder contents that Obsidian does not index', async () => {
+ const f = await fixture({ 'GDrive/a.md': '' });
+ const list = f.app.vault.adapter.list;
+ f.app.vault.adapter.list = async path => path === 'GDrive' ? { files: ['GDrive/.keep'], folders: [] } : list(path);
+ await f.engine.rebuildAtRoot();
+ assert.ok(f.files.has('GDrive'));
+ assert.equal(f.files.has('GDrive/a.md'), false);
+ assert.equal(f.settings.mountMode, 'vaultRoot');
+ f.close();
 });

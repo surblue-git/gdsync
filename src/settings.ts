@@ -456,6 +456,23 @@ export class GdsyncSettingTab extends PluginSettingTab {
 
 		// ---------- メンテナンス ----------
 		new Setting(containerEl).setName(t.headingMaintenance).setHeading();
+		new Setting(containerEl).setName("この端末をリセットしてVault直下へ移行")
+			.setDesc("同期が完了しなくても実行できます。このVaultの通常ファイルを退避し、保留操作・受信差分・同期記録を破棄してDriveから再構築します。")
+			.addButton(button => button.setWarning().setButtonText("リセットして移行／再開").onClick(() => {
+				new SyncReportModal(this.app, "この端末をDriveから作り直す", [
+					"このVaultの通常ファイルは旧ミラー外のファイルも含めて端末内に退避され、ノート一覧から取り除かれます。未送信の編集・移動・削除はDriveへ反映しません。設定・認証・他プラグインは残します。",
+					"Drive上のデータは変更しません。同期やダウンロードの完了は不要です。実行中はノートを編集しないでください。",
+					"完了後、一時停止を解除して「フルスキャンを実行」を押してください。本文・添付は必要に応じて再取得されます。",
+				], async () => {
+					const directory = await this.plugin.engine.rebuildAtRoot();
+					this.display();
+					new SyncReportModal(this.app, "Vault直下への切り替えが完了しました", [
+						"一時停止を解除して「フルスキャンを実行」を押してください。",
+						`退避先（このVault内）: ${directory}。root-rebuild.jsonに元のパスと退避ファイル番号の対応を保存しています。`,
+					]).open();
+				}).open();
+			}));
+
 		new Setting(containerEl).setName(t.diagnoseLinks).addButton((button) =>
 			button.setButtonText(t.btnRun).onClick(async () => {
 				const issues = await this.plugin.engine.diagnoseAttachments();
