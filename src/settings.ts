@@ -126,6 +126,17 @@ export class GdsyncSettingTab extends PluginSettingTab {
 		containerEl.empty();
 		const s = this.plugin.settings;
 
+		new Setting(containerEl).setName(t.syncPausedSetting).setDesc(t.syncPausedDesc)
+			.addToggle(toggle => toggle.setValue(s.syncPaused).onChange(async paused => {
+				try { await this.plugin.engine.setPaused(paused); }
+				catch (error) { toggle.setValue(s.syncPaused); new Notice(String(error), 10000); }
+			}));
+		new Setting(containerEl).setName(t.syncOnStartup).setDesc(t.syncOnStartupDesc)
+			.addToggle(toggle => toggle.setValue(s.syncOnStartup).onChange(async enabled => {
+				s.syncOnStartup = enabled;
+				await this.plugin.saveSettings();
+			}));
+
 		// バージョン表示（新しいビルドが読み込まれているか確認用）
 		containerEl.createEl("p", {
 			text: `GDSync v${this.plugin.manifest.version}`,

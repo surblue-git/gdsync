@@ -38,6 +38,13 @@ function detectLang(): "ja" | "en" {
 }
 
 const en = {
+	pauseSync: "Pause sync",
+	syncPaused: "Sync is paused. Change settings, then resume sync here.",
+	syncStopping: "Stopping sync after the current operation. Wait before changing the sync location.",
+	syncPausedSetting: "Pause sync for settings changes",
+	syncPausedDesc: "Stops new transfers and automatic sync. An in-flight operation finishes first. Notes, authentication and sync records are kept. Pause persists after restarting Obsidian.",
+	syncOnStartup: "Sync automatically on startup",
+	syncOnStartupDesc: "Off by default so you can review settings first. Manual sync and sync when returning to the app remain available unless paused.",
 	syncDetails: "Sync details",
 	syncIdle: "Idle",
 	syncWaiting: "Waiting for transfers / file operations",
@@ -279,6 +286,13 @@ const en = {
 type Strings = typeof en;
 
 const ja: Strings = {
+	pauseSync: "同期を一時停止",
+	syncPaused: "同期は一時停止中です。設定を変更してから、ここで一時停止を解除してください。",
+	syncStopping: "同期を停止中です。処理中の1件が終わるまで、同期先の変更をお待ちください。",
+	syncPausedSetting: "設定変更のため同期を一時停止",
+	syncPausedDesc: "新しい送受信と自動同期を停止します。処理中の1件は完了を待ちます。ノート・認証・同期記録を保持し、Obsidian再起動後も停止状態を維持します。",
+	syncOnStartup: "起動時に自動同期する",
+	syncOnStartupDesc: "設定を先に確認できるよう、初期値はオフです。手動同期とアプリ復帰時の同期は、一時停止中でなければ動作します。",
 	syncDetails: "同期の詳細",
 	syncIdle: "待機中",
 	syncWaiting: "送受信・ファイル処理の終了待ち",

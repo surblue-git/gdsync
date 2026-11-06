@@ -83,8 +83,12 @@ function conflictStamp(): string {
 }
 
 function yieldToUI(): Promise<void> {
+	const scheduler = (globalThis as typeof globalThis & { scheduler?: { yield?: () => Promise<void> } }).scheduler;
+	if (scheduler?.yield) return scheduler.yield();
 	return new Promise((resolve) => setTimeout(resolve, 0));
 }
+
+class SyncPausedError extends Error {}
 
 export class SyncEngine {
 	queue: UploadQueue;
@@ -106,6 +110,7 @@ export class SyncEngine {
 	private networkFailed = false;
 	private parentMetas = new Map<string, Promise<DriveItemMeta>>();
 	private parentPaths = new Map<string, string | undefined>();
+	private yieldAt = 0;
 
 	private setStep(text: string): void {
 		this.step = text;
@@ -117,7 +122,8 @@ export class SyncEngine {
 		const dirty = this.index.dirtyPaths();
 		const conflicts = dirty.filter(path => this.index.getFile(path)?.syncState === "conflict");
 		return [
-			this.migrating || this.migrationRunning ? t.migrationResume : this.step || t.syncIdle,
+			this.paused ? (this.isBusy() ? t.syncStopping : t.syncPaused) :
+				this.migrating || this.migrationRunning ? t.migrationResume : this.step || t.syncIdle,
 			...(this.step ? [t.syncElapsed(Math.floor((Date.now() - this.stepAt) / 1000))] : []),
 			...(snap.currentFile ? [snap.currentFile] : []),
 			t.syncCounts(Object.keys(this.index.data.files).length, dirty.length,
@@ -140,6 +146,35 @@ export class SyncEngine {
 			(path) => this.performUpload(path),
 			() => this.plugin.settings.uploadDebounceSec * 1000
 		);
+		if (this.paused) void this.queue.pause();
+	}
+
+	get paused(): boolean { return this.plugin.settings.syncPaused === true; }
+
+	/** Persist the pause immediately; finish any in-flight write before allowing relocation. */
+	async setPaused(paused: boolean): Promise<void> {
+		if (this.migrationRunning) throw new Error(t.syncAlreadyRunning);
+		if (!paused && this.isBusy()) throw new Error(t.syncStopping);
+		this.plugin.settings.syncPaused = paused;
+		if (paused) void this.queue.pause();
+		await this.plugin.saveSettings();
+		if (!paused) this.resumeQueue();
+	}
+
+	private checkpoint(): void {
+		if (this.paused) throw new SyncPausedError(t.syncPaused);
+	}
+
+	private async checkpointUI(): Promise<void> {
+		if (performance.now() >= this.yieldAt) {
+			await yieldToUI();
+			this.yieldAt = performance.now() + 25;
+		}
+		this.checkpoint();
+	}
+
+	private resumeQueue(): void {
+		if (!this.paused) this.queue.resume();
 	}
 
 	// ---------------- パスヘルパー ----------------
@@ -214,7 +249,7 @@ export class SyncEngine {
 			} finally {
 				this.migrating = await migration.pending();
 				this.status.endProgress();
-				if (!this.migrating) this.queue.resume();
+				if (!this.migrating) this.resumeQueue();
 			}
 		} finally { this.migrationRunning = false; }
 	}
@@ -227,6 +262,7 @@ export class SyncEngine {
 		let checked = 0;
 		for (const file of this.plugin.app.vault.getFiles()) {
 			if (++checked % 50 === 0) await yieldToUI();
+			await this.checkpointUI();
 			const rel = this.toRel(file.path);
 			if (!rel || this.isExcluded(rel)) continue;
 			const e = this.index.getFile(rel);
@@ -320,8 +356,9 @@ export class SyncEngine {
 
 	/** eager 指定に一致するスタブを一括で実体化する（フルスキャン後・起動時・設定変更時） */
 	async hydrateEagerFiles(): Promise<void> {
-		if (!this.plugin.settings.eagerSyncPatterns.trim()) return;
+		if (this.paused || !this.plugin.settings.eagerSyncPatterns.trim()) return;
 		for (const rel of Object.keys(this.index.data.files)) {
+			if (this.paused) return;
 			if (this.isEager(rel)) await this.hydrateStubRel(rel);
 		}
 	}
@@ -333,7 +370,7 @@ export class SyncEngine {
 	 * （オンデマンドの利点を保ったまま、見ているノートの画像は自動で揃う）。
 	 */
 	async hydrateEmbedsOf(file: TFile): Promise<void> {
-		if (this.migrating || this.scanning) return;
+		if (this.paused || this.migrating || this.scanning) return;
 		if (file.extension !== "md") return;
 		const cache = this.plugin.app.metadataCache.getFileCache(file);
 		if (!cache) return;
@@ -341,6 +378,7 @@ export class SyncEngine {
 		if (refs.length === 0) return;
 		const seen = new Set<string>();
 		for (const ref of refs) {
+			if (this.paused) return;
 			const dest = this.plugin.app.metadataCache.getFirstLinkpathDest(
 				ref.link,
 				file.path
@@ -430,7 +468,11 @@ export class SyncEngine {
 	 * 冪等: 既存スタブ・既存インデックスとの差分のみ適用。
 	 */
 	async fullScan(internal = false): Promise<void> {
-		try { this.assertTarget(); } catch (e) { this.notifyError(t.scanFailed, e); return; }
+		if (this.paused) return;
+		try { this.assertTarget(); } catch (e) {
+			if (internal) throw e;
+			this.notifyError(t.scanFailed, e); return;
+		}
 		const s = this.plugin.settings;
 		if (!s.rootFolderId) {
 			new Notice(t.noFolderSelected);
@@ -470,16 +512,21 @@ export class SyncEngine {
 				}
 				return;
 			}
+			// An invalid root must not populate an otherwise empty local checkpoint.
+			await this.reconcileLocal();
 			this.status.progress(t.listingDriveFiles);
 			// リスト取得前にトークンを確保 → スキャン中の変更を取りこぼさない
 			const startToken = await this.drive.getStartPageToken();
 			const items = await this.drive.listAll((count) =>
-				this.status.progress(t.listingDriveFilesCount(count))
+				this.status.progress(t.listingDriveFilesCount(count)),
+				() => this.checkpoint()
 			);
+			this.checkpoint();
 
 			// parents ポインタからツリー再構成（BFS）
 			const children = new Map<string, DriveItemMeta[]>();
 			for (const it of items) {
+				await this.checkpointUI();
 				const p = it.parents?.[0];
 				if (!p) continue;
 				let list = children.get(p);
@@ -496,6 +543,7 @@ export class SyncEngine {
 				{ id: s.rootFolderId, rel: "" },
 			];
 			while (queue.length) {
+				await this.checkpointUI();
 				const cur = queue.shift()!;
 				const kids = (children.get(cur.id) || []).sort((a, b) => a.id.localeCompare(b.id));
 				const usedNames = new Set<string>();
@@ -552,6 +600,7 @@ export class SyncEngine {
 				(a, b) => a.split("/").length - b.split("/").length
 			);
 			for (const rel of sortedFolders) {
+				await this.checkpointUI();
 				await this.ops.ensureFolder(this.toVault(rel));
 				this.index.setFolder(rel, remoteFolders.get(rel)!);
 			}
@@ -562,6 +611,7 @@ export class SyncEngine {
 			let firstError: string | null = null;
 			let i = 0;
 			for (const [rel, meta] of remoteFiles) {
+				await this.checkpointUI();
 				i++;
 				try {
 					let existing = this.index.getFile(rel);
@@ -632,6 +682,7 @@ export class SyncEngine {
 
 			// リモートに存在しなくなったもの
 			for (const rel of Object.keys(this.index.data.files)) {
+				await this.checkpointUI();
 				if (this.isExcluded(rel)) continue;
 				if (remoteFiles.has(rel)) continue;
 				const entry = this.index.getFile(rel)!;
@@ -646,6 +697,7 @@ export class SyncEngine {
 				this.index.deleteFile(rel);
 			}
 			for (const rel of Object.keys(this.index.data.folders)) {
+				await this.checkpointUI();
 				if (remoteFolders.has(rel) || rel === "") continue;
 				const id = this.index.getFolderId(rel);
 				if (!id) continue; // ローカル新規フォルダは残す
@@ -678,19 +730,21 @@ export class SyncEngine {
 			}
 		} catch (e) {
 			this.status.endProgress();
+			if (e instanceof SyncPausedError) return;
 			this.pendingIssues.add("scan");
 			this.notifyError(t.scanFailed, e);
 		} finally {
+			if (this.paused) await this.index.flush();
 			this.scanning = false;
 			if (!this.syncing) this.step = "";
-			if (!internal) this.queue.resume();
+			if (!internal) this.resumeQueue();
 		}
 	}
 
 	// ---------------- ハイドレート ----------------
 
 	async onFileOpen(file: TFile): Promise<void> {
-		if (this.scanning || this.migrating) return;
+		if (this.paused || this.scanning || this.migrating) return;
 		this.assertTarget();
 		const rel = this.toRel(file.path);
 		if (rel === null || rel === "") return;
@@ -816,7 +870,7 @@ export class SyncEngine {
 		if (af instanceof TFolder) {
 			if (this.index.getFolderId(rel) === undefined) {
 				this.index.setFolder(rel, "");
-				if (!this.scanning && !this.syncing) void this.tryEnsureRemoteFolders().catch((e) => this.notifyError(t.syncFailed, e));
+				if (!this.paused && !this.scanning && !this.syncing) void this.tryEnsureRemoteFolders().catch((e) => this.notifyError(t.syncFailed, e));
 			}
 			return;
 		}
@@ -862,7 +916,7 @@ export class SyncEngine {
 			this.index.deleteFile(rel);
 		}
 		this.index.markDirty();
-		if (!this.scanning && !this.syncing) void this.flushPendingOps().catch((e) => this.notifyError(t.syncFailed, e));
+		if (!this.paused && !this.scanning && !this.syncing) void this.flushPendingOps().catch((e) => this.notifyError(t.syncFailed, e));
 	}
 
 	/** ローカルで消えたフォルダ配下のインデックスを整理。trashRemote=true ならリモートもゴミ箱へ */
@@ -935,7 +989,7 @@ export class SyncEngine {
 				}
 			}
 			this.index.markDirty();
-			if (!this.scanning && !this.syncing) void this.flushPendingOps().catch((e) => this.notifyError(t.syncFailed, e));
+			if (!this.paused && !this.scanning && !this.syncing) void this.flushPendingOps().catch((e) => this.notifyError(t.syncFailed, e));
 		} else if (oldRel !== null && oldRel !== "" && newRel === null) {
 			// ベース外へ移動 → Drive 上はゴミ箱へ（復元可能な保険）
 			if (af instanceof TFolder) {
@@ -954,7 +1008,7 @@ export class SyncEngine {
 				}
 			}
 			this.index.markDirty();
-			if (!this.scanning && !this.syncing) void this.flushPendingOps().catch((e) => this.notifyError(t.syncFailed, e));
+			if (!this.paused && !this.scanning && !this.syncing) void this.flushPendingOps().catch((e) => this.notifyError(t.syncFailed, e));
 		} else if (oldRel === null && newRel !== null && newRel !== "") {
 			// ベース外から移入 → 新規としてアップロード対象に
 			if (af instanceof TFolder) {
@@ -981,7 +1035,7 @@ export class SyncEngine {
 				}
 			}
 		}
-		if (!this.scanning && !this.syncing) void this.tryEnsureRemoteFolders().catch((e) => this.notifyError(t.syncFailed, e));
+		if (!this.paused && !this.scanning && !this.syncing) void this.tryEnsureRemoteFolders().catch((e) => this.notifyError(t.syncFailed, e));
 	}
 
 	// ---------------- アップロード ----------------
@@ -1322,11 +1376,13 @@ export class SyncEngine {
 
 	/** ローカルで作成された未同期フォルダ（id=''）をリモートに作成 */
 	async tryEnsureRemoteFolders(): Promise<void> {
+		if (this.paused) return;
 		const pending = Object.entries(this.index.data.folders)
 			.filter(([, id]) => !id)
 			.map(([p]) => p)
 			.sort((a, b) => a.split("/").length - b.split("/").length);
 		for (const rel of pending) {
+			this.checkpoint();
 			try {
 				await this.ensureRemoteFolder(rel);
 			} catch (e) {
@@ -1338,6 +1394,7 @@ export class SyncEngine {
 	// ---------------- 保留中の構造変更 ----------------
 
 	async flushPendingOps(): Promise<void> {
+		if (this.paused) return;
 		if (this.opsTask) return this.opsTask;
 		const task = this.performPendingOps();
 		this.opsTask = task;
@@ -1349,6 +1406,7 @@ export class SyncEngine {
 		await Promise.all(Array.from(this.locks.values()));
 		try {
 			while (this.index.data.pendingOps.length > 0) {
+				this.checkpoint();
 				const op = this.index.data.pendingOps[0];
 				try {
 					if (op.kind === "trashRemote") {
@@ -1391,7 +1449,7 @@ export class SyncEngine {
 		if (!token) return; // フルスキャン前
 		let result;
 		try {
-			result = await this.drive.listChanges(token);
+			result = await this.drive.listChanges(token, () => this.checkpoint());
 		} catch (e) {
 			if (e instanceof ApiError && [400, 404, 410].includes(e.status)) {
 				new Notice(t.changeTokenExpired);
@@ -1419,13 +1477,16 @@ export class SyncEngine {
 		for (const id of Object.keys(errors)) if (!retained.has(id)) delete errors[id];
 		let n = 0;
 		for (const c of changes) {
+			this.checkpoint();
 			this.setStep(t.syncApplying(++n, changes.length, c.file?.name ?? c.fileId));
 			try {
 				await this.applyChange(c);
 				this.index.data.incoming = this.index.data.incoming!.filter((item) => item !== c);
 				delete errors[c.fileId];
+				this.index.markDirty();
 			} catch (e) {
 				errors[c.fileId] = `${c.file?.name ?? c.fileId}: ${e instanceof Error ? e.message : String(e)}`;
+				this.index.markDirty();
 				console.error('gdsync: incoming change retained', c.fileId, e);
 				if (e instanceof NetworkError || this.networkFailed) break;
 			}
@@ -1651,6 +1712,7 @@ export class SyncEngine {
 			});
 			this.status.remoteChange("added");
 			// eager 指定なら新規スタブをその場で実体化
+			if (this.paused) return;
 			if (this.isEager(rel)) await this.hydrateStubRel(rel);
 		}
 	}
@@ -1718,6 +1780,7 @@ export class SyncEngine {
 	 * Automatic cycles stay quiet; manual cycles show the same pending/success result.
 	 */
 	async syncNow(opts?: { awaitUploads?: boolean; notify?: boolean }): Promise<void> {
+		if (this.paused) { if (opts?.notify) new Notice(t.syncPaused); return; }
 		if (this.scanning || this.syncing || this.migrating || this.migrationRunning) {
 			if (opts?.notify) new Notice(this.getDiagnostics().join("\n"), 12000);
 			return;
@@ -1731,17 +1794,23 @@ export class SyncEngine {
 			this.lastError = "";
 			this.setStep(t.syncWaiting);
 			await this.queue.pause();
+			this.checkpoint();
 			await Promise.all(Array.from(this.locks.values()));
 			if (this.opsTask) await this.opsTask;
 			if (!this.index.data.changesPageToken) await this.fullScan(true);
+			this.checkpoint();
 			if (!this.index.data.changesPageToken) throw new Error(t.syncNotReady);
 			this.setStep(t.syncReconciling);
 			await this.reconcileLocal();
+			this.checkpoint();
 			this.setStep(t.syncSending);
 			await this.flushPendingOps();
+			this.checkpoint();
 			await this.tryEnsureRemoteFolders();
+			this.checkpoint();
 			this.setStep(t.syncReceiving);
 			await this.pullChanges();
+			this.checkpoint();
 			if (this.networkFailed) throw new NetworkError(this.lastError);
 			this.openAttachments.clear();
 			const openNotes: TFile[] = [];
@@ -1749,27 +1818,32 @@ export class SyncEngine {
 				if (leaf.view instanceof FileView && leaf.view.file?.extension === "md") openNotes.push(leaf.view.file);
 			});
 			for (const file of openNotes) await this.hydrateEmbedsOf(file);
-			this.queue.resume();
+			this.resumeQueue();
 			this.setStep(t.syncSending);
 			// Attachments first. A second phase reads current notes only after that attempt.
 			await this.queue.runNow(this.index.dirtyPaths().filter((rel) => !rel.endsWith(".md")));
+			this.checkpoint();
 			await this.queue.runNow(this.index.dirtyPaths().filter((rel) => rel.endsWith(".md")));
+			this.checkpoint();
 			await this.flushPendingOps();
+			this.checkpoint();
 			this.setStep(t.syncSaving);
 			await this.index.flush();
 		} catch (e) {
 			failed = true;
 			this.lastError = e instanceof Error ? e.message : String(e);
-			if (e instanceof NetworkError) this.status.setOffline();
+			if (e instanceof SyncPausedError) { /* Stopped at a durable boundary. */ }
+			else if (e instanceof NetworkError) this.status.setOffline();
 			else this.notifyError(t.syncFailed, e);
 		} finally {
+			if (this.paused) await this.index.flush();
 			this.syncing = false;
 			this.step = "";
-			this.queue.resume();
+			this.resumeQueue();
 			const pending = this.index.dirtyPaths().length;
 			const ops = this.index.data.pendingOps.length + Object.values(this.index.data.folders).filter(id => !id).length;
 			const incoming = this.index.data.incoming?.length ?? 0;
-			const summary = this.status.endSync({ pending, ops, incoming, failed: failed || this.pendingIssues.size > 0 });
+			const summary = this.status.endSync({ pending, ops, incoming, failed: this.paused || failed || this.pendingIssues.size > 0 });
 			this.syncing = false;
 			if (opts?.notify) new Notice('GDSync: ' + (summary ?? t.syncNoChanges), 6000);
 		}
@@ -1777,6 +1851,7 @@ export class SyncEngine {
 
 	/** 古い/多すぎるキャッシュを脱ハイドレート */
 	async evictCache(): Promise<void> {
+		if (this.paused) return;
 		if (this.migrating || this.scanning || this.syncing) return;
 		const s = this.plugin.settings;
 		const now = Date.now();
@@ -1804,6 +1879,7 @@ export class SyncEngine {
 		}
 		let evicted = 0;
 		for (const { rel, entry } of evictSet) {
+			if (this.paused) { await this.index.flush(); return; }
 			await this.withLock(rel, async () => {
 				if (!entry.hydrated || entry.dirty) return;
 				const f = this.ops.getFile(this.toVault(rel));

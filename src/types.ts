@@ -39,6 +39,9 @@ export interface GdsyncSettings {
 	eagerSyncPatterns: string;
 	/** デスクトップでも同期機能を有効にする（既定はモバイルのみ） */
 	enableOnDesktop: boolean;
+	/** Device-local controls; never imported from a connection code. */
+	syncPaused: boolean;
+	syncOnStartup: boolean;
 	uploadDebounceSec: number;
 	/** ハイドレート済みファイルの鮮度再確認間隔（分） */
 	freshnessTtlMin: number;
@@ -60,6 +63,8 @@ export const DEFAULT_SETTINGS: GdsyncSettings = {
 	excludePatterns: ".obsidian\n.trash",
 	eagerSyncPatterns: "",
 	enableOnDesktop: false,
+	syncPaused: false,
+	syncOnStartup: false,
 	uploadDebounceSec: 4,
 	freshnessTtlMin: 5,
 	tokens: null,

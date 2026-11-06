@@ -614,3 +614,121 @@ test('failed incoming file creation remains durable even when the full scan adva
 	assert.equal(f.index.data.changesPageToken, 'start');
 	assert.equal(f.index.data.incoming[0].fileId, 'a'); f.close();
 });
+
+test('persistent pause blocks sync and scans but preserves local structural edits', async () => {
+	const f = await fixture({ 'GDrive/a.md': 'mine' }); f.track('a.md');
+	let requests = 0; f.drive.listChanges = f.drive.listAll = async () => { requests++; throw Error('unexpected network'); };
+	let saved = 0; f.plugin.saveSettings = async () => { saved++; };
+	await f.engine.setPaused(true);
+	await f.engine.syncNow(); await f.engine.fullScan();
+	await f.app.vault.rename(f.files.get('GDrive/a.md'), 'GDrive/renamed.md');
+	assert.equal(requests, 0); assert.equal(saved, 1);
+	assert.equal(f.plugin.settings.syncPaused, true);
+	assert.equal(f.index.data.pendingOps[0].kind, 'renameRemote');
+	assert.equal(f.engine.isBusy(), false);
+	const reloaded = new SyncEngine(f.plugin, f.drive, f.index, f.ops, f.status);
+	let ran = false; reloaded.queue.schedule('renamed.md', true);
+	f.drive.upload = async () => { ran = true; throw Error('unexpected upload'); };
+	await tick(); assert.equal(ran, false); reloaded.queue.clear(); f.close();
+});
+
+test('pause during a full listing does not advance the scan cursor or discard notes', async () => {
+	const f = await fixture({ 'GDrive/local.md': 'unsent' }); f.track('local.md', { dirty: true });
+	f.index.data.changesPageToken = null;
+	const listing = deferred(), entered = deferred();
+	f.drive.listAll = async () => { entered.resolve(); return listing.promise; };
+	const cycle = f.engine.syncNow(); await entered.promise;
+	await f.engine.setPaused(true);
+	await assert.rejects(f.engine.setPaused(false), /Stopping sync/);
+	listing.resolve([]); await cycle;
+	assert.equal(f.engine.isBusy(), false);
+	assert.equal(f.index.data.changesPageToken, null);
+	assert.equal(text(f.files.get('GDrive/local.md')), 'unsent');
+	assert.equal(f.index.getFile('local.md').dirty, true);
+	assert.equal(f.status.getSnapshot().lastSuccessAt, undefined); f.close();
+});
+
+test('pause after applying one incoming change preserves the rest across resume', async () => {
+	const f = await fixture();
+	f.drive.listChanges = async () => ({ changes: [remoteChange('a.md'), remoteChange('b.md')], newStartPageToken: 'next' });
+	const applied = [];
+	f.engine.applyChange = async c => { applied.push(c.fileId); await f.engine.setPaused(true); };
+	await f.engine.syncNow();
+	assert.deepEqual(applied, ['remote-a.md']);
+	assert.equal(f.index.data.incoming.length, 1);
+	const persisted = JSON.parse(f.disk.get('.obsidian/plugins/gdsync/index.json'));
+	assert.equal(persisted.incoming[0].fileId, 'remote-b.md');
+	f.drive.listChanges = async () => ({ changes: [], newStartPageToken: 'next' });
+	f.engine.applyChange = async c => { applied.push(c.fileId); };
+	await f.engine.setPaused(false); await f.engine.syncNow();
+	assert.deepEqual(applied, ['remote-a.md', 'remote-b.md']);
+	assert.equal(f.index.data.incoming.length, 0); f.close();
+});
+
+test('pausing a queue releases runNow without discarding pending transfers', async () => {
+	const write = deferred(); let started = 0;
+	const q = new UploadQueue(async () => { started++; await write.promise; return true; }, () => 1);
+	const drain = q.runNow(['a', 'b', 'c', 'd']); await tick();
+	assert.equal(started, 3);
+	const stopped = q.pause(); await drain;
+	assert.equal(q.has('d'), true);
+	write.resolve(); await stopped; assert.equal(started, 3);
+	q.resume(); await q.drainPending(); assert.equal(started, 4); q.clear();
+});
+
+test('Drive listings stop between pages when a pause is requested', async () => {
+	const { DriveClient } = require('../src/drive-client.ts');
+	const client = new DriveClient({ getAccessToken: async () => 'test' });
+	let requests = 0, paused = false;
+	obsidian.requestUrl = async () => { requests++; paused = true; return { status: 200, json: { nextPageToken: 'more', files: [], changes: [] } }; };
+	const checkpoint = () => { if (paused) throw Error('paused'); };
+	await assert.rejects(client.listAll(undefined, checkpoint), /paused/); assert.equal(requests, 1);
+	paused = false; requests = 0;
+	await assert.rejects(client.listChanges('old', checkpoint), /paused/); assert.equal(requests, 1);
+});
+
+test('startup initializes settings access without automatically syncing by default', async () => {
+	obsidian.Plugin = class {}; obsidian.Modal = class {}; obsidian.FuzzySuggestModal = class {}; obsidian.PluginSettingTab = class {};
+	const Plugin = require('../src/main.ts').default;
+	const f = await fixture(); let cycles = 0;
+	f.app.workspace.on = f.app.vault.on = f.app.metadataCache.on = () => ({});
+	f.registerEvent = f.registerDomEvent = () => {};
+	f.ensureNoMedia = async () => {};
+	f.engine.syncNow = async () => { cycles++; };
+	global.document = { visibilityState: 'visible' };
+	try {
+		await Plugin.prototype.startup.call(f);
+		assert.equal(f.index.ready, true); assert.equal(cycles, 0);
+		f.settings.syncOnStartup = true;
+		await Plugin.prototype.startup.call(f); assert.equal(cycles, 1);
+		await f.engine.setPaused(true);
+		await Plugin.prototype.startup.call(f); assert.equal(cycles, 1);
+	} finally { delete global.document; f.close(); }
+});
+
+test('pause during an upload keeps relocation blocked until its result is acknowledged', async () => {
+	const f = await fixture({ 'GDrive/a.txt': 'mine' });
+	f.track('a.txt', { dirty: true });
+	const writing = deferred(), entered = deferred();
+	f.drive.getMeta = async () => ({ md5Checksum: 'base' });
+	f.drive.upload = async () => { entered.resolve(); return writing.promise; };
+	const cycle = f.engine.syncNow(); await entered.promise;
+	await f.engine.setPaused(true); await cycle;
+	assert.equal(f.engine.isBusy(), true);
+	assert.equal(f.engine.canChangeTarget(), false);
+	writing.resolve({ id: 'id-a.txt', md5Checksum: require('../src/content-md5.ts').md5Hex(bytes('mine')), size: '4' });
+	await tick();
+	assert.equal(f.engine.isBusy(), false);
+	assert.equal(f.index.getFile('a.txt').dirty, false);
+	assert.equal(f.status.getSnapshot().lastSuccessAt, undefined); f.close();
+});
+
+test('a paused engine can migrate existing files while keeping automatic transfers paused', async () => {
+	const f = await fixture({ 'GDrive/a.md': 'mine' }); f.track('a.md');
+	await f.engine.setPaused(true);
+	await f.engine.migrateToRoot();
+	assert.equal(f.settings.mountMode, 'vaultRoot');
+	assert.equal(f.settings.syncPaused, true);
+	assert.equal(text(f.files.get('a.md')), 'mine');
+	assert.equal(f.index.getFile('a.md').fileId, 'id-a.md'); f.close();
+});

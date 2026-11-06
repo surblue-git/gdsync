@@ -117,11 +117,13 @@ export class DriveClient {
 
 	/** マイドライブ全体のファイル/フォルダ一覧（ページング吸収）。onPage は進捗通知用 */
 	async listAll(
-		onPage?: (count: number) => void
+		onPage?: (count: number) => void,
+		checkpoint?: () => void
 	): Promise<DriveItemMeta[]> {
 		const items: DriveItemMeta[] = [];
 		let pageToken: string | undefined;
 		do {
+			checkpoint?.();
 			const params = new URLSearchParams({
 				q: "trashed=false",
 				fields: `nextPageToken,files(${FILE_FIELDS})`,
@@ -259,12 +261,14 @@ export class DriveClient {
 	 * pageToken 失効（400/404/410）は ApiError のまま投げる → 呼び出し側でフル再スキャン
 	 */
 	async listChanges(
-		pageToken: string
+		pageToken: string,
+		checkpoint?: () => void
 	): Promise<{ changes: DriveChange[]; newStartPageToken: string }> {
 		const changes: DriveChange[] = [];
 		let token = pageToken;
 		let newStart = "";
 		for (; ;) {
+			checkpoint?.();
 			const params = new URLSearchParams({
 				pageToken: token,
 				fields: `nextPageToken,newStartPageToken,changes(fileId,removed,file(${FILE_FIELDS}))`,

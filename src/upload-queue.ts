@@ -7,6 +7,7 @@ export class UploadQueue {
 	private active = new Set<Promise<void>>();
 	private paused = false;
 	private stopped = false;
+	private pauseWaiters = new Set<() => void>();
 	private activePaths = new Set<string>();
 	private ready = new Map<string, QueueItem>();
 	constructor(private run: (path: string) => Promise<boolean>, private baseDelayMs: () => number) { }
@@ -44,6 +45,7 @@ export class UploadQueue {
 	}
 	async pause(): Promise<void> {
 		this.paused = true;
+		for (const settle of this.pauseWaiters) settle();
 		this.ready.clear();
 		for (const item of this.items.values()) window.clearTimeout(item.timer);
 		await Promise.all(Array.from(this.active));
@@ -70,8 +72,14 @@ export class UploadQueue {
 		await Promise.all([...Array.from(this.items.values(), (i) => i.done), ...this.active]);
 	}
 	async runNow(paths: string[]): Promise<void> {
+		if (this.paused || this.stopped) return;
+		let settle!: () => void;
+		const interrupted = new Promise<void>(resolve => { settle = resolve; });
+		this.pauseWaiters.add(settle);
 		for (const path of paths) this.schedule(path, true);
-		await Promise.all(paths.map((path) => this.items.get(path)?.done));
+		try {
+			await Promise.race([Promise.all(paths.map((path) => this.items.get(path)?.done)), interrupted]);
+		} finally { this.pauseWaiters.delete(settle); }
 	}
 	private async execute(path: string, item: QueueItem): Promise<void> {
 		if (this.paused || this.stopped || this.items.get(path) !== item) return;

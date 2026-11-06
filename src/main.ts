@@ -47,6 +47,11 @@ export default class GdsyncPlugin extends Plugin {
 			callback: () => void this.engine.fullScan(),
 		});
 		this.addCommand({
+			id: "pause-sync",
+			name: t.pauseSync,
+			callback: () => void this.engine.setPaused(true).catch(e => new Notice(String(e))),
+		});
+		this.addCommand({
 			id: "sync-now",
 			name: t.cmdSyncNow,
 			callback: () => void this.engine.syncNow({ awaitUploads: true, notify: true }),
@@ -174,10 +179,11 @@ export default class GdsyncPlugin extends Plugin {
 			}
 		});
 
-		if (this.isActive()) {
+		if (this.isActive()) await this.ensureNoMedia();
+		if (this.isActive() && this.settings.syncOnStartup && !this.settings.syncPaused) {
 			// ミラー生成でフォルダが作られる前に置く（MediaStore が索引する前に除外させる）
-			await this.ensureNoMedia();
 			await this.engine.syncNow();
+			if (this.settings.syncPaused) return;
 			// eager 指定ファイルは起動時に実体を揃える（他プラグインが読む前に）
 			await this.engine.hydrateEagerFiles();
 			await this.engine.evictCache();
