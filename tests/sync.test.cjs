@@ -848,3 +848,32 @@ test('root rebuild preserves hidden folder contents that Obsidian does not index
  assert.equal(f.settings.mountMode, 'vaultRoot');
  f.close();
 });
+
+test('root rebuild skips the Vault root and invalid cleanup paths when resuming a 0.9.5 checkpoint', async () => {
+	const f = await fixture({ 'GDrive/a.md': 'archived note', '.obsidian/keep.json': 'settings' });
+	const { vault } = f.app;
+	const getAllLoadedFiles = vault.getAllLoadedFiles;
+	vault.getAllLoadedFiles = () => [...getAllLoadedFiles(), new TFolder('/')];
+	const list = vault.adapter.list;
+	vault.adapter.list = async () => { throw Error('interrupted after archiving files'); };
+	await assert.rejects(f.engine.rebuildAtRoot(), /interrupted after archiving/);
+	assert.equal(f.files.has('GDrive/a.md'), false);
+
+	const journalPath = '.obsidian/plugins/gdsync/root-rebuild.json';
+	const journal = JSON.parse(f.disk.get(journalPath));
+	assert.equal(journal.folders.includes('/'), false);
+	journal.folders.unshift('/', 'old:folder', '.obsidian');
+	f.disk.set(journalPath, JSON.stringify(journal));
+	vault.adapter.list = async path => {
+		assert.equal(path, 'GDrive');
+		return list(path);
+	};
+
+	await f.engine.restoreMigrationState();
+	assert.equal(await f.engine.rebuildAtRoot(), journal.directory);
+	assert.equal(f.settings.mountMode, 'vaultRoot');
+	assert.equal(f.engine.migrating, false);
+	assert.equal(new TextDecoder().decode(f.disk.get(`${journal.directory}/0.bin`)), 'archived note');
+	assert.equal(text(f.files.get('.obsidian/keep.json')), 'settings');
+	f.close();
+});

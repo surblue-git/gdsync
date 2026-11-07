@@ -1,4 +1,4 @@
-import { Platform, TFile } from "obsidian";
+import { Platform, TFile, TFolder } from "obsidian";
 import type GdsyncPlugin from "./main";
 import { contentHash } from "./mount-migration";
 import { protectedPath, validPath } from "./sync-paths";
@@ -45,7 +45,7 @@ export class RootRebuild {
 				if (await a.exists(source)) await a.write(`${directory}/${name}`, await a.read(source));
 			}
 			const files = app.vault.getFiles().map(f => f.path).filter(p => !protectedPath(p, app.vault.configDir));
-			const folders = app.vault.getAllLoadedFiles().filter(f => !(f instanceof TFile) && f.path && !protectedPath(f.path, app.vault.configDir))
+			const folders = app.vault.getAllLoadedFiles().filter(f => f instanceof TFolder && validPath(f.path) && !protectedPath(f.path, app.vault.configDir))
 				.map(f => f.path).sort((x, y) => y.length - x.length);
 			j = { version: 1, rootId: settings.rootFolderId, directory, phase: "archiving", files, folders };
 			await a.write(`${directory}/paths.json`, JSON.stringify(j));
@@ -80,7 +80,9 @@ export class RootRebuild {
 			throw new Error("復旧中にファイルが作成されました。編集を止めて再実行してください。");
 		}
 		for (const path of j.folders) {
-			if (!validPath(path) || protectedPath(path, app.vault.configDir)) throw new Error("Invalid rebuild folder");
+			// Older checkpoints can include the vault root ("/") and paths that
+			// cannot be cleaned up. Removing empty folders is optional.
+			if (typeof path !== "string" || !validPath(path) || protectedPath(path, app.vault.configDir)) continue;
 			const folder = this.plugin.ops.getFolder(path);
 			if (folder?.children.length === 0) {
 				const children = await a.list(path);
