@@ -121,12 +121,21 @@ export class VaultOps {
 	async writeContent(file: TFile, data: ArrayBuffer, guard: () => boolean = () => true): Promise<boolean> {
 		if (!guard()) return false;
 		let written = true;
+		let text: string | undefined;
 		if (isTextExt(file.extension)) {
-			const text = new TextDecoder("utf-8").decode(data);
+			try {
+				text = new TextDecoder("utf-8", { ignoreBOM: true, fatal: true }).decode(data);
+			} catch (error) {
+				// Preserve non-UTF-8 documents byte for byte via modifyBinary below.
+				if (!(error instanceof TypeError)) throw error;
+			}
+		}
+		if (text !== undefined) {
+			const content = text;
 			await this.app.vault.process(file, (current) => {
 				if (!guard()) { written = false; return current; }
 				this.suppressor.add(file.path);
-				return text;
+				return content;
 			});
 		} else {
 			this.suppressor.add(file.path);
@@ -179,4 +188,9 @@ export function sanitizeName(name: string): string {
 		.replace(/[\\/:*?"<>|]/g, "_")
 		.replace(/[. ]+$/, "")
 		.trim() || "_";
+}
+
+/** Legacy desktop mirrors replaced unsafe filename characters with spaces. */
+export function legacySpacedName(name: string): string {
+	return name.replace(/[\\/:*?"<>|]/g, " ").replace(/[. ]+$/, "").trim() || "_";
 }

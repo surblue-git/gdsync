@@ -8,6 +8,7 @@ export interface SyncSnapshot {
 	/** 現在処理中のファイル名（natがあれば最後に触ったもの）。なければ null */
 	currentFile: string | null;
 	uploaded: number;
+	matched: number;
 	uploadedFailed: number;
 	downloaded: number;
 	remoteAdded: number;
@@ -32,6 +33,7 @@ export class StatusDisplay {
 		phase: "idle",
 		currentFile: null,
 		uploaded: 0,
+		matched: 0,
 		uploadedFailed: 0,
 		downloaded: 0,
 		remoteAdded: 0,
@@ -85,6 +87,7 @@ export class StatusDisplay {
 			phase: "syncing",
 			currentFile: null,
 			uploaded: 0,
+			matched: 0,
 			uploadedFailed: 0,
 			downloaded: 0,
 			remoteAdded: 0,
@@ -107,6 +110,7 @@ export class StatusDisplay {
 		this.snap.phase = "idle";
 		const parts: string[] = [];
 		const s = this.snap;
+		if (s.matched) parts.push(t.syncContentMatched(s.matched));
 		if (s.uploaded || s.uploadedFailed) {
 			parts.push(t.syncClientUploads(s.uploaded, s.uploadedFailed));
 		}
@@ -135,12 +139,13 @@ export class StatusDisplay {
 		return id;
 	}
 
-	uploadFinished(id: string, ok: boolean): void {
+	uploadFinished(id: string, ok: boolean | "matched" | "downloaded"): void {
 		this.uploading.delete(id);
 		if (ok) this.offline = false;
 		if (this.cycleRunning) {
-			if (ok) this.snap.uploaded++;
-			else this.snap.uploadedFailed++;
+			if (ok === "matched") this.snap.matched++;
+			else if (ok === true) this.snap.uploaded++;
+			else if (!ok) this.snap.uploadedFailed++;
 		}
 		this.render();
 	}

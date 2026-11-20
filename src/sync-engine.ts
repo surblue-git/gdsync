@@ -572,9 +572,9 @@ export class SyncEngine {
 			const queue: Array<{ id: string; rel: string }> = [
 				{ id: s.rootFolderId, rel: "" },
 			];
-			while (queue.length) {
+			for (let cursor = 0; cursor < queue.length; cursor++) {
 				await this.checkpointUI();
-				const cur = queue.shift()!;
+				const cur = queue[cursor];
 				const kids = (children.get(cur.id) || []).sort((a, b) => a.id.localeCompare(b.id));
 				const usedNames = new Set<string>();
 				for (const kid of kids) {
@@ -820,11 +820,10 @@ export class SyncEngine {
 	}
 
 	/** 実体をダウンロードしてファイルへ書き込む。呼び出し側でロック取得済みであること */
-	private async downloadInto(file: TFile, entry: IndexEntry): Promise<boolean> {
+	private async downloadInto(file: TFile, entry: IndexEntry, expectedDirty = false): Promise<boolean> {
 		const revision = entry.revision ?? 0;
 		const expectedMtime = file.stat.mtime;
 		const expectedPath = file.path;
-		const remoteMd5 = entry.remoteMd5;
 		const maxSize = this.plugin.settings.maxFileSizeMB * 1024 * 1024;
 		if (entry.remoteSize > maxSize) {
 			entry.tooLarge = true;
@@ -838,11 +837,14 @@ export class SyncEngine {
 			const data = await this.drive.download(entry.fileId);
 			const localMd5 = md5Hex(data);
 			const unchanged = () => (entry.revision ?? 0) === revision &&
-				file.path === expectedPath && file.stat.mtime === expectedMtime && !entry.dirty;
+				file.path === expectedPath && file.stat.mtime === expectedMtime && entry.dirty === expectedDirty;
 			if (!await this.ops.writeContent(file, data, unchanged)) return false;
+			if ((entry.revision ?? 0) !== revision || file.path !== expectedPath ||
+				this.ops.getFile(expectedPath) !== file) return false;
 			entry.hydrated = true;
-			entry.hydratedMd5 = remoteMd5 ?? localMd5;
-			entry.remoteMd5 = remoteMd5 ?? localMd5;
+			entry.hydratedMd5 = localMd5;
+			entry.remoteMd5 = localMd5;
+			entry.remoteSize = data.byteLength;
 			entry.localMd5 = localMd5;
 			entry.dirty = false;
 			entry.syncState = "clean";
@@ -1084,6 +1086,9 @@ export class SyncEngine {
 			if (!file) return true; // 既に消えていた
 			const revision = entry.revision ?? 0;
 			const mtimeBeforeUpload = file.stat.mtime;
+			const stillCurrent = () => this.index.getFile(rel) === entry &&
+				this.ops.getFile(this.toVault(rel)) === file &&
+				(entry.revision ?? 0) === revision && file.stat.mtime === mtimeBeforeUpload;
 			let data: ArrayBuffer;
 			try {
 				data = await this.ops.readBinary(file);
@@ -1099,14 +1104,16 @@ export class SyncEngine {
 				return true;
 			}
 			if (file.extension === "md" && !await this.uploadAttachments(file, new TextDecoder().decode(data))) return false;
-			if ((entry.revision ?? 0) !== revision || file.stat.mtime !== mtimeBeforeUpload) return false;
+			if (!stillCurrent()) return false;
 			// ガード3: ローカルが空でリモートに内容がある場合は事故防止のため送らない
 			if (data.byteLength === 0 && entry.remoteSize > 0 && !entry.hydratedMd5) {
-				new Notice(t.emptyUploadCancelled(file.name));
+				this.pendingIssues.add(rel);
+				this.lastError = t.emptyUploadCancelled(file.path);
 				return true;
 			}
 			const transfer = this.status.uploadStarting(file.path);
-			let ok = false;
+			let ifMatch: string | undefined;
+			let ok: boolean | "matched" | "downloaded" = false;
 			try {
 				if (entry.fileId) {
 					// 競合チェック（他端末の更新を上書きしない）
@@ -1117,6 +1124,7 @@ export class SyncEngine {
 							"md5Checksum,modifiedTime,size,trashed"
 						);
 					} catch (e) {
+						if (!stillCurrent()) return false;
 						if (e instanceof ApiError && e.status === 404) {
 							entry.creationId = undefined;
 							entry.fileId = ""; // リモートで完全削除済み → 新規作成
@@ -1124,7 +1132,9 @@ export class SyncEngine {
 							throw e;
 						}
 					}
+					if (!stillCurrent()) return false;
 					if (remote) {
+						ifMatch = remote.etag;
 						if (remote.trashed) {
 							entry.creationId = undefined;
 							entry.fileId = ""; // ゴミ箱行き → 新規作成で復活
@@ -1145,7 +1155,7 @@ export class SyncEngine {
 								this.rememberLocal(file, entry);
 								this.index.markDirty();
 								await this.index.flush();
-								ok = true;
+								ok = "matched";
 								return true;
 							}
 							if (localChanged && remoteChanged) {
@@ -1157,9 +1167,8 @@ export class SyncEngine {
 								entry.remoteMd5 = remote.md5Checksum;
 								entry.remoteModifiedTime = ts(remote.modifiedTime);
 								entry.remoteSize = num(remote.size);
-								entry.dirty = false;
-								if (!await this.downloadInto(file, entry)) entry.dirty = true;
-								ok = true;
+								if (!await this.downloadInto(file, entry, true)) return false;
+								ok = "downloaded";
 								return true;
 							}
 						}
@@ -1169,12 +1178,39 @@ export class SyncEngine {
 				const parentId = isNew
 					? await this.ensureRemoteFolder(parentOf(rel))
 					: undefined;
+				if (parentId) {
+					const matches = await this.drive.findChildrenByName(parentId, file.name);
+					if (!stillCurrent()) return false;
+					if (matches.length && !(matches.length === 1 && matches[0].id === entry.creationId)) {
+						const match = matches[0];
+						if (matches.length !== 1 || match.mimeType.startsWith(GOOGLE_APPS_PREFIX) ||
+							match.md5Checksum !== localMd5 || !this.canAdopt(rel, match)) {
+							this.pendingIssues.add(rel);
+							this.lastError = t.syncNameCollision(rel);
+							return true;
+						}
+						entry.fileId = match.id;
+						entry.hydratedMd5 = entry.remoteMd5 = localMd5;
+						entry.remoteSize = num(match.size);
+						entry.remoteModifiedTime = ts(match.modifiedTime);
+						entry.dirty = false;
+						entry.syncState = "clean";
+						entry.creationId = undefined;
+						this.rememberLocal(file, entry);
+						this.index.setFile(rel, entry);
+						await this.index.flush();
+						ok = "matched";
+						return true;
+					}
+				}
 				if (isNew && !entry.creationId) {
 					entry.creationId = await this.drive.generateId();
 					this.index.markDirty();
 					await this.index.flush();
 				}
+				if (!stillCurrent()) return false;
 				const res = await this.drive.upload({
+					ifMatch,
 					creationId: entry.creationId,
 					fileId: entry.fileId || undefined,
 					name: isNew ? file.name : undefined,
@@ -1219,6 +1255,10 @@ export class SyncEngine {
 				ok = true;
 				return true;
 			} catch (e) {
+				if (e instanceof ApiError && e.status === 412) {
+					this.lastError = t.syncChangedDuringUpload(rel);
+					return false;
+				}
 				if (e instanceof AuthError) {
 					new Notice(`GDSync: ${e.message}`);
 					ok = false; // 未送信（要再認証）: 再認証されるまでリトライしない
@@ -1391,6 +1431,15 @@ export class SyncEngine {
 		const existing = this.index.getFolderId(rel);
 		if (existing) return existing;
 		const parentId = await this.ensureRemoteFolder(parentOf(rel));
+		const matches = await this.drive.findChildrenByName(parentId, baseName(rel));
+		if (matches.length) {
+			const match = matches[0];
+			if (matches.length !== 1 || match.mimeType !== FOLDER_MIME || !this.canAdopt(rel, match))
+				throw new Error(t.syncNameCollision(rel));
+			this.index.setFolder(rel, match.id);
+			await this.index.flush();
+			return match.id;
+		}
 		const ids = this.index.data.folderCreationIds ?? (this.index.data.folderCreationIds = {});
 		if (!ids[rel]) {
 			ids[rel] = await this.drive.generateId();
@@ -1402,6 +1451,11 @@ export class SyncEngine {
 		await this.index.flush();
 		this.status.opFlushed();
 		return id;
+	}
+
+	private canAdopt(rel: string, match: DriveItemMeta): boolean {
+		const known = this.index.pathById(match.id);
+		return (!known || known === rel) && !this.index.data.pendingOps.some(op => op.fileId === match.id);
 	}
 
 	/** ローカルで作成された未同期フォルダ（id=''）をリモートに作成 */

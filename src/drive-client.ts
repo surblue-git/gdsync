@@ -3,6 +3,7 @@ import { AuthManager } from "./auth";
 import { t } from "./i18n";
 import { DriveChange, DriveItemMeta } from "./types";
 import { readWithTimeout } from "./request-timeout";
+import { sanitizeName, legacySpacedName } from "./vault-ops";
 
 const API = "https://www.googleapis.com/drive/v3";
 const UPLOAD_API = "https://www.googleapis.com/upload/drive/v3";
@@ -24,6 +25,7 @@ export class ApiError extends Error {
 }
 
 export interface UploadParams {
+	ifMatch?: string;
 	/** 既存ファイルの更新なら指定 (PATCH)、新規なら undefined (POST) */
 	fileId?: string;
 	creationId?: string;
@@ -140,6 +142,24 @@ export class DriveClient {
 		return items;
 	}
 
+	/** Read-only, parent-scoped lookup. Keep all pages to detect ambiguous same-name matches. */
+	async findChildrenByName(parentId: string, name: string, includeLegacy = false): Promise<DriveItemMeta[]> {
+		const escape = (value: string) => value.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+		const items: DriveItemMeta[] = [];
+		let pageToken: string | undefined;
+		do {
+			const params = new URLSearchParams({
+				q: `'${escape(parentId)}' in parents${includeLegacy ? "" : ` and name='${escape(name)}'`} and trashed=false`,
+				fields: `nextPageToken,files(${FILE_FIELDS})`, pageSize: "1000", spaces: "drive",
+			});
+			if (pageToken) params.set("pageToken", pageToken);
+			const result = await this.call({ url: `${API}/files?${params.toString()}` });
+			items.push(...(result.json.files ?? []));
+			pageToken = result.json.nextPageToken;
+		} while (pageToken);
+		return includeLegacy ? items.filter(item => item.name === name || sanitizeName(item.name) === name || legacySpacedName(item.name) === name) : items;
+	}
+
 	/** フォルダ選択UI用: 全フォルダ（id, name, parents） */
 	async listAllFolders(): Promise<DriveItemMeta[]> {
 		const items: DriveItemMeta[] = [];
@@ -163,7 +183,8 @@ export class DriveClient {
 		const res = await this.call({
 			url: `${API}/files/${fileId}?fields=${encodeURIComponent(fields)}`,
 		});
-		return res.json as DriveItemMeta;
+		const etag = Object.entries(res.headers ?? {}).find(([key]) => key.toLowerCase() === "etag")?.[1];
+		return { ...res.json, etag };
 	}
 
 	async download(fileId: string): Promise<ArrayBuffer> {
@@ -191,6 +212,7 @@ export class DriveClient {
 			res = await this.call({
 				url,
 				method: p.fileId ? "PATCH" : "POST",
+				headers: p.fileId && p.ifMatch ? { "If-Match": p.ifMatch } : undefined,
 				contentType,
 				body,
 			});

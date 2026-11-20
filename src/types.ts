@@ -210,6 +210,7 @@ export function emptyIndex(): GdsyncIndex {
 }
 
 export interface DriveItemMeta {
+	etag?: string;
 	gdsyncRecovered?: boolean;
 	id: string;
 	name: string;

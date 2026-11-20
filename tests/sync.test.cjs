@@ -126,6 +126,7 @@ async function fixture(initial = {}, mode = 'subfolder') {
 	plugin.status = new StatusDisplay(plugin);
 	let ids = 0;
 	const drive = {
+		findChildrenByName: async () => [],
 		generateId: async () => 'generated-' + ++ids,
 		createFolder: async (_, __, id) => id,
 		getMeta: async id => ({ id, mimeType: 'application/vnd.google-apps.folder', parents: [], name: 'root' }),
@@ -359,14 +360,91 @@ test('queue limits concurrent transfers and never runs the same path twice concu
 	hold.resolve(); await q.drainPending(); q.clear(); assert.equal(max, 3);
 });
 
-test('an edit during remote metadata lookup remains dirty after the old bytes upload', async () => {
+test('an edit during remote metadata lookup stays pending without sending stale bytes', async () => {
 	const f = await fixture({ 'GDrive/a.md': 'old' });
 	const entry = f.track('a.md', { dirty: true, revision: 1 });
 	f.drive.getMeta = async () => { await f.app.vault.modifyBinary(f.files.get('GDrive/a.md'), bytes('new')); return { md5Checksum: 'base' }; };
 	let uploaded;
 	f.drive.upload = async p => { uploaded = new TextDecoder().decode(p.data); return { id: 'id-a.md', md5Checksum: 'old-hash' }; };
 	await f.engine.performUpload('a.md');
-	assert.equal(uploaded, 'old'); assert.equal(entry.dirty, true); assert.equal(text(f.files.get('GDrive/a.md')), 'new'); f.close();
+	assert.equal(uploaded, undefined); assert.equal(entry.dirty, true); assert.equal(text(f.files.get('GDrive/a.md')), 'new'); f.close();
+});
+
+test('a second device adopts an identical file in an existing folder without a Drive write', async () => {
+	const f = await fixture({ 'GDrive/写真/旅.jpg': 'image' });
+	const entry = f.track('写真/旅.jpg', { fileId: '', dirty: true });
+	const drive = recoveryDrive(f, { '写真/旅.jpg': 'image' });
+	const meta = drive.metadata.get('id-写真/旅.jpg');
+	meta.parents = ['folder'];
+	const queries = [];
+	f.drive.findChildrenByName = async (parent, name) => {
+		queries.push([parent, name]);
+		return parent === 'root' ? [{ id: 'folder', mimeType: 'application/vnd.google-apps.folder' }] : [meta];
+	};
+	f.status.beginSync();
+	assert.equal(await f.engine.performUpload('写真/旅.jpg'), true);
+	assert.match(f.status.endSync(), /Already identical on Drive: 1/);
+	assert.equal(f.status.getSnapshot().uploaded, 0);
+	assert.deepEqual(queries, [['root', '写真'], ['folder', '旅.jpg']]);
+	assert.deepEqual(drive.writes, []);
+	assert.equal(entry.dirty, false);
+	assert.equal(f.index.pathById(meta.id), '写真/旅.jpg');
+	assert.equal(f.index.getFolderId('写真'), 'folder');
+	f.close();
+});
+
+test('different or ambiguous same-name files stay pending with a diagnostic across attempts', async () => {
+	const f = await fixture({ 'GDrive/a.jpg': 'local' });
+	const entry = f.track('a.jpg', { fileId: '', dirty: true });
+	const drive = recoveryDrive(f, { 'a.jpg': 'remote' });
+	const meta = drive.metadata.get('id-a.jpg');
+	for (const matches of [[meta], [meta, { ...meta, id: 'other' }]]) {
+		f.drive.findChildrenByName = async () => matches;
+		await f.engine.performUpload('a.jpg');
+		assert.equal(entry.fileId, '');
+		assert.equal(entry.dirty, true);
+		assert.match(f.engine.getDiagnostics().join('\n'), /a.jpg.*same-name/);
+	}
+	assert.deepEqual(drive.writes, []);
+	assert.equal(text(f.files.get('GDrive/a.jpg')), 'local');
+	f.close();
+});
+
+test('an intervening remote update causes a conditional upload to retry and converge', async () => {
+	const f = await fixture({ 'GDrive/a.jpg': 'edited' });
+	const entry = f.track('a.jpg', { dirty: true });
+	const hash = require('../src/content-md5.ts').md5Hex(bytes('edited'));
+	let remoteHash = 'base';
+	f.drive.getMeta = async () => ({ md5Checksum: remoteHash, etag: '"first"' });
+	let writes = 0;
+	f.drive.upload = async p => {
+		writes++;
+		assert.equal(p.ifMatch, '"first"');
+		remoteHash = hash;
+		throw new (require('../src/drive-client.ts').ApiError)(412, 'precondition failed');
+	};
+	assert.equal(await f.engine.performUpload('a.jpg'), false);
+	assert.equal(entry.dirty, true);
+	assert.equal(await f.engine.performUpload('a.jpg'), true);
+	assert.equal(entry.dirty, false);
+	assert.equal(writes, 1);
+	f.close();
+});
+
+test('remote-only changes retain the pending edit on download failure and baseline the bytes received on retry', async () => {
+	const f = await fixture({ 'GDrive/a.jpg': 'base' });
+	const hash = require('../src/content-md5.ts').md5Hex;
+	const entry = f.track('a.jpg', { dirty: true, hydratedMd5: hash(bytes('base')) });
+	f.drive.getMeta = async () => ({ md5Checksum: hash(bytes('remote version one')) });
+	f.drive.download = async () => { assert.equal(entry.dirty, true); throw Error('offline'); };
+	assert.equal(await f.engine.performUpload('a.jpg'), false);
+	assert.equal(entry.dirty, true);
+	f.drive.download = async () => bytes('remote version two');
+	assert.equal(await f.engine.performUpload('a.jpg'), true);
+	assert.equal(entry.dirty, false);
+	assert.equal(entry.hydratedMd5, hash(bytes('remote version two')));
+	assert.equal(text(f.files.get('GDrive/a.jpg')), 'remote version two');
+	f.close();
 });
 
 test('download does not overwrite an edit made during the network request', async () => {
@@ -374,6 +452,19 @@ test('download does not overwrite an edit made during the network request', asyn
 	f.drive.download = async () => { await f.app.vault.modifyBinary(f.files.get('GDrive/a.md'), bytes('edited')); return bytes('remote'); };
 	assert.equal(await f.engine.downloadInto(f.files.get('GDrive/a.md'), entry), false);
 	assert.equal(text(f.files.get('GDrive/a.md')), 'edited'); assert.equal(entry.dirty, true); f.close();
+});
+
+test('text downloads preserve Windows BOMs and non-UTF-8 document bytes', async () => {
+	const f = await fixture({ 'GDrive/a.txt': '' });
+	const entry = f.track('a.txt');
+	const file = f.files.get('GDrive/a.txt');
+	for (const data of [bytes('\uFEFF日本語\r\n'), Uint8Array.of(0x82, 0xa0, 13, 10).buffer]) {
+		f.drive.download = async () => data;
+		assert.equal(await f.engine.downloadInto(file, entry), true);
+		assert.deepEqual(new Uint8Array(file.data), new Uint8Array(data));
+		assert.equal(entry.hydratedMd5, require('../src/content-md5.ts').md5Hex(file.data));
+	}
+	f.close();
 });
 
 test('received changes are persisted before application and failures survive another pull', async () => {
