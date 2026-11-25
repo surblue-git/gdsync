@@ -179,35 +179,14 @@ export default class GdsyncPlugin extends Plugin {
 			}
 		});
 
-		if (this.isActive()) await this.ensureNoMedia();
-		if (this.isActive() && this.settings.syncOnStartup && !this.settings.syncPaused) {
-			// ミラー生成でフォルダが作られる前に置く（MediaStore が索引する前に除外させる）
+		if (!this.isActive() || this.settings.syncPaused) return;
+		await this.ops.ensureNoMedia(this.engine.basePath());
+		if (this.settings.syncOnStartup && !this.settings.syncPaused) {
 			await this.engine.syncNow();
 			if (this.settings.syncPaused) return;
 			// eager 指定ファイルは起動時に実体を揃える（他プラグインが読む前に）
 			await this.engine.hydrateEagerFiles();
 			await this.engine.evictCache();
-		}
-	}
-
-	/**
-	 * Android のメディアスキャナ(MediaStore)からミラーを隠す。
-	 * ミラールート直下に空の `.nomedia` を置くと、そのフォルダと全サブフォルダが
-	 * ギャラリー/Lightroom/Google フォト等の索引対象から外れる。
-	 * `.nomedia` はドット始まりなので Obsidian の Vault レイヤーからは不可視で、
-	 * gdsync 自身の同期対象にも拾われない。Android 以外では no-op。
-	 */
-	private async ensureNoMedia(): Promise<void> {
-		if (!Platform.isAndroidApp) return;
-		const adapter = this.app.vault.adapter;
-		const base = this.engine.basePath();
-		const marker = base ? `${base}/.nomedia` : ".nomedia";
-		try {
-			if (await adapter.exists(marker)) return;
-			if (base && !(await adapter.exists(base))) await adapter.mkdir(base);
-			await adapter.write(marker, "");
-		} catch (e) {
-			console.warn("gdsync: failed to create .nomedia", e);
 		}
 	}
 

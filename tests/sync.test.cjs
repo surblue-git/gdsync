@@ -631,6 +631,37 @@ test('cache eviction updates its local fingerprint so the empty stub is not reup
 	await f.engine.reconcileLocal(); assert.equal(f.index.getFile('a.md').dirty, false); assert.equal(f.index.getFile('a.md').hydrated, false); f.close();
 });
 
+test('a delayed modify event on an empty stub leaves it eligible for download', async () => {
+	const f = await fixture({ 'GDrive/a.md': '' });
+	const entry = f.track('a.md', { hydrated: false, hydratedMd5: undefined, remoteSize: 6 });
+	const file = f.files.get('GDrive/a.md');
+	const noticeCount = notices.length;
+	await f.app.vault.modifyBinary(file, bytes(''));
+	assert.equal(notices.length, noticeCount);
+	assert.equal(entry.hydrated, false);
+	assert.equal(entry.dirty, false);
+	assert.equal(f.engine.queue.has('a.md'), false);
+	await f.engine.onFileOpen(file);
+	assert.equal(text(file), 'remote');
+	assert.equal(entry.hydrated, true);
+	f.close();
+});
+
+test('local content written to an unhydrated stub retains conflict protection', async () => {
+	const f = await fixture({ 'GDrive/a.md': '' });
+	const entry = f.track('a.md', { hydrated: false, hydratedMd5: undefined, remoteSize: 6 });
+	const file = f.files.get('GDrive/a.md');
+	await f.app.vault.modifyBinary(file, bytes('local content'));
+	assert.match(notices.at(-1), /a\.md/);
+	assert.equal(entry.hydrated, true);
+	assert.equal(entry.dirty, true);
+	assert.equal(entry.hydratedMd5, undefined);
+	assert.equal(f.engine.queue.has('a.md'), true);
+	await f.engine.onFileOpen(file);
+	assert.equal(text(file), 'local content');
+	f.close();
+});
+
 test('corrupt index recovers the durable incoming queue from the temporary checkpoint', async () => {
 	const f = await fixture(); const saved = { ...f.index.data, incoming: [{ fileId: 'pending', removed: true }] };
 	f.disk.set('.obsidian/plugins/gdsync/index.json', '{');
@@ -786,7 +817,6 @@ test('startup initializes settings access without automatically syncing by defau
 	const f = await fixture(); let cycles = 0;
 	f.app.workspace.on = f.app.vault.on = f.app.metadataCache.on = () => ({});
 	f.registerEvent = f.registerDomEvent = () => {};
-	f.ensureNoMedia = async () => {};
 	f.engine.syncNow = async () => { cycles++; };
 	global.document = { visibilityState: 'visible' };
 	try {
@@ -797,6 +827,25 @@ test('startup initializes settings access without automatically syncing by defau
 		await f.engine.setPaused(true);
 		await Plugin.prototype.startup.call(f); assert.equal(cycles, 1);
 	} finally { delete global.document; f.close(); }
+});
+
+test('Android startup leaves an absent mirror alone and a full scan creates it with a media marker', async () => {
+	obsidian.Plugin = class {}; obsidian.Modal = class {}; obsidian.FuzzySuggestModal = class {}; obsidian.PluginSettingTab = class {};
+	const Plugin = require('../src/main.ts').default;
+	const f = await fixture();
+	f.app.workspace.on = f.app.vault.on = f.app.metadataCache.on = () => ({});
+	f.registerEvent = f.registerDomEvent = () => {};
+	global.document = { visibilityState: 'visible' };
+	obsidian.Platform.isAndroidApp = true;
+	try {
+		await Plugin.prototype.startup.call(f);
+		assert.equal(f.files.has('GDrive'), false);
+		assert.equal(f.disk.has('GDrive'), false);
+		assert.equal(f.disk.has('GDrive/.nomedia'), false);
+		await f.engine.fullScan();
+		assert.ok(f.files.has('GDrive'));
+		assert.equal(f.disk.get('GDrive/.nomedia'), '');
+	} finally { delete global.document; delete obsidian.Platform.isAndroidApp; f.close(); }
 });
 
 test('pause during an upload keeps relocation blocked until its result is acknowledged', async () => {

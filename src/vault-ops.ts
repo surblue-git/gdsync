@@ -1,4 +1,4 @@
-import { App, normalizePath, TAbstractFile, TFile, TFolder } from "obsidian";
+import { App, normalizePath, Platform, TAbstractFile, TFile, TFolder } from "obsidian";
 
 /** vault.process で扱うテキスト拡張子。それ以外はバイナリとして modifyBinary */
 const TEXT_EXTS = new Set([
@@ -64,6 +64,18 @@ export class VaultOps {
 
 	exists(path: string): boolean {
 		return this.app.vault.getAbstractFileByPath(normalizePath(path)) !== null;
+	}
+
+	/** Keep Android's media scanner out of an existing mirror. */
+	async ensureNoMedia(base: string): Promise<void> {
+		if (!Platform.isAndroidApp || (base && !this.getFolder(base))) return;
+		const adapter = this.app.vault.adapter;
+		const marker = base ? `${base}/.nomedia` : ".nomedia";
+		try {
+			if (!await adapter.exists(marker)) await adapter.write(marker, "");
+		} catch (e) {
+			console.warn("gdsync: failed to create .nomedia", e);
+		}
 	}
 
 	/** フォルダを再帰的に作成（存在すればスキップ、イベント抑制付き） */

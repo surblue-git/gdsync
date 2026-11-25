@@ -626,6 +626,7 @@ export class SyncEngine {
 			// --- ローカルへ反映 ---
 			this.status.progress(t.creatingFolders);
 			await this.ops.ensureFolder(this.basePath());
+			await this.ops.ensureNoMedia(this.basePath());
 			const sortedFolders = Array.from(remoteFolders.keys()).sort(
 				(a, b) => a.split("/").length - b.split("/").length
 			);
@@ -879,8 +880,9 @@ export class SyncEngine {
 			return;
 		}
 		if (!entry.hydrated && entry.fileId) {
-			// ガード1: 未ハイドレートのスタブ編集はアップロードさせない
-			new Notice(t.stubEditWarning);
+			// An empty stub can emit a modify event without any change to its bytes.
+			if (file.stat.size === 0) return;
+			new Notice(t.stubEditWarning(rel));
 			// Preserve the edit. With no baseline, upload creates a conflict copy.
 			entry.hydrated = true;
 			entry.hydratedMd5 = undefined;

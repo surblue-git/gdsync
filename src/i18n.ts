@@ -166,8 +166,8 @@ const en = {
 		`GDSync: ${name} exceeds the size limit and will not be downloaded.`,
 	downloading: (name: string) => `Downloading ${name}…`,
 	downloadFailed: (name: string) => `Failed to download ${name}`,
-	stubEditWarning:
-		"GDSync: This file was edited before its content was downloaded. Your edit is preserved; sync will keep a conflict copy.",
+	stubEditWarning: (path: string) =>
+		`GDSync: Local content appeared before download: ${path}. Sync will preserve it in a conflict copy if it differs from Drive.`,
 	emptyUploadCancelled: (name: string) =>
 		`GDSync: Upload of ${name} was cancelled because it is empty while the remote copy has content. If this is intentional, open the remote version once and then edit it.`,
 	offlineUploadPending: "Offline (upload pending)",
@@ -417,8 +417,8 @@ const ja: Strings = {
 		`GDSync: ${name} はサイズ上限を超えるためダウンロードしません。`,
 	downloading: (name: string) => `${name} をダウンロード中…`,
 	downloadFailed: (name: string) => `${name} のダウンロードに失敗`,
-	stubEditWarning:
-		"GDSync: 未取得のファイルが編集されました。編集内容を保持し、同期時に競合コピーとして保護します。",
+	stubEditWarning: (path: string) =>
+		`GDSync: 未取得のファイルにローカルの内容が追加されました（${path}）。Driveと内容が異なる場合は、同期時に競合コピーとして保持します。`,
 	emptyUploadCancelled: (name: string) =>
 		`GDSync: ${name} は空でリモート側に内容があるため、アップロードを中止しました。意図的な場合は、一度リモート版を開いてから編集してください。`,
 	offlineUploadPending: "オフライン（アップロード保留中）",
