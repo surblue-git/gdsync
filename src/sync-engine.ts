@@ -221,8 +221,16 @@ export class SyncEngine {
 		if (this.migrating) new Notice(t.migrationResume, 15000);
 	}
 
+	rebuildAtRoot(): Promise<string> {
+		return this.rebuildDevice();
+	}
+
+	async resetDeviceSync(): Promise<string> {
+		return this.rebuildDevice(this.basePath());
+	}
+
 	/** Escape a broken sync without uploading old edits, deletes or empty stubs. */
-	async rebuildAtRoot(): Promise<string> {
+	private async rebuildDevice(base?: string): Promise<string> {
 		if (!this.index.ready) throw new Error("GDSync: 同期記録の初期化を待ってから実行してください。");
 		if (this.migrationRunning) throw new Error(t.syncAlreadyRunning);
 		if (!this.plugin.settings.rootFolderId) throw new Error(t.noFolderSelected);
@@ -236,9 +244,10 @@ export class SyncEngine {
 			while (this.syncing || this.scanning) await new Promise(resolve => setTimeout(resolve, 25));
 			await Promise.all([...this.locks.values(), ...this.folderTasks.values()]);
 			if (this.opsTask) await this.opsTask;
+			if (base !== undefined && await new MountMigration(this.plugin).pending()) throw new Error(t.resetResumeOriginal);
 			this.migrating = true;
 			for (const path of this.index.dirtyPaths()) this.queue.cancel(path);
-			const directory = await rebuild.run();
+			const directory = await rebuild.run(base, rel => this.isExcluded(rel));
 			this.pendingIssues.clear();
 			this.parentMetas.clear();
 			this.parentPaths.clear();

@@ -96,16 +96,26 @@ class ConnectionCodeModal extends Modal {
 }
 
 class SyncReportModal extends Modal {
-	constructor(app: App, private heading: string, private lines: string[], private action?: () => Promise<void>) { super(app); }
+	constructor(app: App, private heading: string, private lines: string[], private action?: () => Promise<void>, private actionLabel?: string) { super(app); }
 	onOpen(): void {
 		this.setTitle(this.heading);
 		for (const line of this.lines) this.contentEl.createEl("p", { text: line });
-		if (this.action) new Setting(this.contentEl).addButton((button) =>
-			button.setButtonText(t.btnRun).setCta().onClick(async () => {
+		if (!this.action) return;
+		const controls = new Setting(this.contentEl);
+		if (this.actionLabel) controls.addButton(button => {
+			button.setButtonText(t.resetCancel).onClick(() => this.close());
+			button.buttonEl.focus();
+		});
+		controls.addButton(button => {
+			button.setButtonText(this.actionLabel ?? t.btnRun);
+			if (this.actionLabel) button.setWarning();
+			else button.setCta();
+			button.onClick(async () => {
 				button.setDisabled(true);
 				try { await this.action!(); this.close(); }
 				catch (e) { new Notice(String(e), 15000); button.setDisabled(false); }
-			}));
+			});
+		});
 	}
 	onClose(): void { this.contentEl.empty(); }
 }
@@ -530,21 +540,16 @@ export class GdsyncSettingTab extends PluginSettingTab {
 		new Setting(containerEl)
 			.setName(t.resetIndex)
 			.setDesc(t.resetIndexDesc)
-			.addButton((btn) =>
-				btn.setWarning().setButtonText(t.btnReset).onClick(async () => {
-					const dirty = this.plugin.index.dirtyPaths().length;
-					if (dirty > 0 || this.plugin.engine.isBusy() || this.plugin.index.data.pendingOps.length || this.plugin.index.data.incoming?.length) {
-						new Notice(t.unsentEdits(dirty));
-						return;
-					}
-					// Keep stub identities and baselines; forgetting them makes a zero-byte
-					// placeholder indistinguishable from a real empty local file.
-					this.plugin.index.data.changesPageToken = null;
-					this.plugin.index.data.lastFullScan = 0;
-					this.plugin.index.markDirty();
-					await this.plugin.index.flush();
-					new Notice(t.indexReset);
-				})
-			);
+			.addButton(button => button.setWarning().setButtonText(t.btnReset).onClick(() => {
+				new SyncReportModal(this.app, t.resetIndex, [
+					t.resetScope(s.mountMode === "vaultRoot" ? "" : s.baseFolder),
+					t.resetPending,
+					t.resetNext,
+				], async () => {
+					const directory = await this.plugin.engine.resetDeviceSync();
+					this.display();
+					new SyncReportModal(this.app, t.resetComplete, [t.resetNext, t.resetBackup(directory)]).open();
+				}, t.resetConfirm).open();
+			}));
 	}
 }

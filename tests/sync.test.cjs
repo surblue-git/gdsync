@@ -1017,3 +1017,61 @@ test('root rebuild skips the Vault root and invalid cleanup paths when resuming 
 	assert.equal(text(f.files.get('.obsidian/keep.json')), 'settings');
 	f.close();
 });
+
+test('device reset clears a stuck path collision and rebuilds the same mirror from Drive', async () => {
+	const f = await fixture({
+		'GDrive/a.md': 'unsent edit',
+		'GDrive/private/local.md': 'excluded',
+		'outside.md': 'outside mirror',
+	});
+	f.settings.excludePatterns += '\nprivate/';
+	f.track('a.md', { fileId: '', dirty: true });
+	const change = remoteChange();
+	f.index.data.incoming = [change];
+	f.index.data.pendingOps = [{ kind: 'trashRemote', fileId: 'unrelated' }];
+	await assert.rejects(f.engine.applyChange(change), /File path collision/);
+	const driveCalls = [];
+	for (const name of Object.keys(f.drive)) {
+		f.drive[name] = async () => { driveCalls.push(name); throw Error(name); };
+	}
+
+	const backup = await f.engine.resetDeviceSync();
+	assert.deepEqual(driveCalls, []);
+	assert.equal(f.settings.mountMode, 'subfolder');
+	assert.equal(f.settings.syncPaused, true);
+	assert.equal(f.index.data.mountBase, 'GDrive');
+	assert.deepEqual(f.index.data.pendingOps, []);
+	assert.equal(f.index.data.incoming, undefined);
+	assert.equal(f.files.has('GDrive/a.md'), false);
+	assert.equal(text(f.files.get('GDrive/private/local.md')), 'excluded');
+	assert.equal(text(f.files.get('outside.md')), 'outside mirror');
+	assert.equal(new TextDecoder().decode(f.disk.get(`${backup}/0.bin`)), 'unsent edit');
+	assert.deepEqual(JSON.parse(f.disk.get(`${backup}/paths.json`)).files, ['GDrive/a.md']);
+
+	f.drive.getMeta = async () => ({ id: 'root', mimeType: 'application/vnd.google-apps.folder' });
+	f.drive.getStartPageToken = async () => 'start';
+	f.drive.listAll = async () => [change.file];
+	await f.engine.setPaused(false);
+	await f.engine.fullScan();
+	assert.equal(text(f.files.get('GDrive/a.md')), '');
+	assert.equal(f.index.getFile('a.md').fileId, change.fileId);
+	assert.deepEqual(driveCalls, []);
+	f.close();
+});
+
+test('device reset after a completed root migration makes a fresh backup each time', async () => {
+	const f = await fixture({ 'GDrive/a.md': 'first copy' });
+	const first = await f.engine.rebuildAtRoot();
+	f.put('a.md', 'second copy');
+	const second = await f.engine.resetDeviceSync();
+	f.put('a.md', 'third copy');
+	const third = await f.engine.resetDeviceSync();
+
+	assert.equal(new Set([first, second, third]).size, 3);
+	for (const [directory, content] of [[first, 'first copy'], [second, 'second copy'], [third, 'third copy']]) {
+		assert.equal(new TextDecoder().decode(f.disk.get(`${directory}/0.bin`)), content);
+	}
+	assert.equal(f.files.has('a.md'), false);
+	assert.equal(f.settings.mountMode, 'vaultRoot');
+	f.close();
+});

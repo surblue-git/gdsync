@@ -1,13 +1,16 @@
 import { Platform, TFile, TFolder } from "obsidian";
 import type GdsyncPlugin from "./main";
 import { contentHash } from "./mount-migration";
-import { protectedPath, validPath } from "./sync-paths";
+import { protectedPath, relativePath, validPath } from "./sync-paths";
+import { t } from "./i18n";
 
 interface RebuildJournal {
 	version: 1;
 	rootId: string;
 	directory: string;
 	phase: "archiving" | "complete";
+	// Missing in legacy checkpoints, which always migrate to the vault root.
+	mountBase?: string;
 	files: string[];
 	folders: string[];
 }
@@ -22,6 +25,7 @@ export class RootRebuild {
 		const j = JSON.parse(await a.read(this.path)) as RebuildJournal;
 		if (j.version !== 1 || !Array.isArray(j.files) || !Array.isArray(j.folders) ||
 			!["archiving", "complete"].includes(j.phase) ||
+			(j.mountBase !== undefined && (typeof j.mountBase !== "string" || !validPath(j.mountBase, true))) ||
 			!j.directory.startsWith(`${this.plugin.manifest.dir}/root-rebuild-backup-`) || !validPath(j.directory)) {
 			throw new Error("Invalid root rebuild checkpoint");
 		}
@@ -29,13 +33,22 @@ export class RootRebuild {
 	}
 	async pending(): Promise<boolean> { return (await this.load())?.phase === "archiving"; }
 
-	async run(): Promise<string> {
+	async run(base?: string, isExcluded?: (relative: string) => boolean): Promise<string> {
 		const { app, settings, index } = this.plugin;
 		const a = app.vault.adapter;
+		const inScope = (path: string) => {
+			if (!validPath(path) || protectedPath(path, app.vault.configDir)) return false;
+			if (base === undefined) return true;
+			const relative = relativePath(base, path);
+			return relative !== null && relative !== "" && !isExcluded?.(relative);
+		};
 		let j = await this.load();
-		if (j?.phase === "complete") return j.directory;
-		if (!j) {
-			const directory = `${this.plugin.manifest.dir}/root-rebuild-backup-${Date.now()}`;
+		if (j?.phase === "archiving" && j.mountBase !== base) throw new Error(t.resetResumeOriginal);
+		if (!j || j.phase === "complete") {
+			const prefix = `${this.plugin.manifest.dir}/root-rebuild-backup-`;
+			let stamp = Date.now();
+			while (await a.exists(prefix + stamp)) stamp++;
+			const directory = prefix + stamp;
 			await a.mkdir(directory);
 			// Keep configuration and all old checkpoints for manual recovery, including
 			// pending remote deletes/renames that must never run after this reset.
@@ -44,10 +57,10 @@ export class RootRebuild {
 				const source = `${this.plugin.manifest.dir}/${name}`;
 				if (await a.exists(source)) await a.write(`${directory}/${name}`, await a.read(source));
 			}
-			const files = app.vault.getFiles().map(f => f.path).filter(p => !protectedPath(p, app.vault.configDir));
-			const folders = app.vault.getAllLoadedFiles().filter(f => f instanceof TFolder && validPath(f.path) && !protectedPath(f.path, app.vault.configDir))
+			const files = app.vault.getFiles().map(f => f.path).filter(inScope);
+			const folders = app.vault.getAllLoadedFiles().filter(f => f instanceof TFolder && inScope(f.path))
 				.map(f => f.path).sort((x, y) => y.length - x.length);
-			j = { version: 1, rootId: settings.rootFolderId, directory, phase: "archiving", files, folders };
+			j = { version: 1, rootId: settings.rootFolderId, directory, phase: "archiving", mountBase: base, files, folders };
 			await a.write(`${directory}/paths.json`, JSON.stringify(j));
 			await a.write(this.path, JSON.stringify(j));
 		}
@@ -59,6 +72,7 @@ export class RootRebuild {
 			const backup = `${j.directory}/${n}.bin`;
 			const file = app.vault.getAbstractFileByPath(path);
 			if (file instanceof TFile) {
+				if (!inScope(path)) throw new Error(t.resetScopeChanged(path));
 				const data = await app.vault.readBinary(file);
 				await a.writeBinary(backup, data);
 				const hash = await contentHash(data);
@@ -70,19 +84,21 @@ export class RootRebuild {
 			await new Promise(resolve => setTimeout(resolve, 0));
 		}
 		// Include files created while archiving rather than letting them become uploads.
-		const added = app.vault.getFiles().map(f => f.path).filter(p => !protectedPath(p, app.vault.configDir) && !j!.files.includes(p));
+		const remaining = app.vault.getFiles().map(f => f.path).filter(inScope);
+		const archivedPaths = new Set(j.files);
+		const added = remaining.filter(path => !archivedPaths.has(path));
 		if (added.length) {
 			j.files.push(...added);
 			await a.write(`${j.directory}/paths.json`, JSON.stringify(j));
 			await a.write(this.path, JSON.stringify(j));
 		}
-		if (app.vault.getFiles().some(f => !protectedPath(f.path, app.vault.configDir))) {
+		if (remaining.length) {
 			throw new Error("復旧中にファイルが作成されました。編集を止めて再実行してください。");
 		}
 		for (const path of j.folders) {
 			// Older checkpoints can include the vault root ("/") and paths that
 			// cannot be cleaned up. Removing empty folders is optional.
-			if (typeof path !== "string" || !validPath(path) || protectedPath(path, app.vault.configDir)) continue;
+			if (typeof path !== "string" || !inScope(path)) continue;
 			const folder = this.plugin.ops.getFolder(path);
 			if (folder?.children.length === 0) {
 				const children = await a.list(path);
@@ -94,13 +110,13 @@ export class RootRebuild {
 		await a.write(`${this.plugin.manifest.dir}/mount-migration.json`, complete);
 		await a.write(`${this.plugin.manifest.dir}/mount-migration.json.tmp`, complete);
 		index.reset(j.rootId);
-		index.data.mountBase = "";
+		index.data.mountBase = base ?? "";
 		await index.flush();
-		settings.mountMode = "vaultRoot";
+		if (base === undefined) settings.mountMode = "vaultRoot";
 		settings.syncPaused = true;
 		settings.syncOnStartup = false;
 		await this.plugin.saveSettings();
-		if (Platform.isAndroidApp && !await a.exists(".nomedia")) await a.write(".nomedia", "");
+		if (Platform.isAndroidApp && !base && !await a.exists(".nomedia")) await a.write(".nomedia", "");
 		j.phase = "complete";
 		await a.write(this.path, JSON.stringify(j));
 		return j.directory;
